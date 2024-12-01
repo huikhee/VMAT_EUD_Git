@@ -1,0 +1,53 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Distribution / packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDE specific files
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Jupyter Notebook
+.ipynb_checkpoints
+*.ipynb
+
+# Local development settings
+.env
+.env.local
+
+# Model checkpoints and data
+models/
+*.pth
+*.pt
+*.h5
+*.npz
+*.npy
+
+# Logs
+logs/
+*.log
+
+# Test coverage
+.coverage
+htmlcov/
+
+# Documentation
+docs/_build/
+
+# macOS specific
+.DS_Store 
