@@ -1280,7 +1280,7 @@ if __name__ == "__main__":
     val_loaders = []
 
     # Generate or load datasets
-    for dataset_num in range(0, 640, 1):
+    for dataset_num in range(480, 640, 1):
         start_time = time.time()
 
         if generate_flag == 0:
