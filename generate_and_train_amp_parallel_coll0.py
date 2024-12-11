@@ -1363,6 +1363,8 @@ def setup(rank, world_size):
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.deterministic = False
 
+
+
 def cleanup():
     dist.destroy_process_group()
 
