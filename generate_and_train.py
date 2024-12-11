@@ -933,7 +933,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
                          lr=lr, weight_decay=1e-4)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
     
-    return (optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, 
+    return (optimizer, scheduler, criterion, start_epoch, train_losses, val_losses,
             train_accuracies, val_accuracies)
 
 
@@ -941,7 +941,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
 
 def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, resume=0):
     # Setup training parameters
-    EPOCHS = 1
+    EPOCHS = 300
     optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies = setup_training(encoderunet, unetdecoder, resume)
     
     # Print settings

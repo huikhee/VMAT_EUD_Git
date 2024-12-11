@@ -7,7 +7,7 @@ import sys
 
 import numpy as np
 import time
-from datetime import datetime
+from datetime import timedelta
 
 import torch
 import torch.nn as nn
@@ -42,7 +42,12 @@ import matplotlib.pyplot as plt
 
 import os
 
+from torch.cuda.amp import autocast, GradScaler
 
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -330,6 +335,7 @@ def create_boundary_matrix(vector1, vector2, scalar1, scalar2, scalar3):
         rotated_matrix = scipy.ndimage.rotate(matrix, 0, reshape=False, mode='constant', cval=0.0)
         matrix_collection.append(rotated_matrix)
 
+
     return matrix_collection
 
 def interpolate_vectors(v1_start, v1_end, v2_start, v2_end, s2_start, s2_end, 
@@ -416,7 +422,7 @@ def load_dataset(dataset_num):
             return None
     return None
 
-def generate_and_save_dataset(dataset_num):
+def generate_and_save_dataset(dataset_num, KM):
     """Generate and save a complete dataset."""
     # Choose the appropriate vector generation function based on dataset number
     if 0 <= dataset_num <= 79:
@@ -504,6 +510,9 @@ def generate_and_save_dataset(dataset_num):
 class ExtEncoder(nn.Module):
     def __init__(self, vector_dim, scalar_count, latent_image_size):
         super(ExtEncoder, self).__init__()
+        # Store latent_image_size as instance variable
+        self.latent_image_size = latent_image_size
+        
         # Processing the vector inputs
         self.vector_fc = nn.Linear(vector_dim * 2, 512)
         
@@ -511,10 +520,7 @@ class ExtEncoder(nn.Module):
         self.scalar_fc = nn.ModuleList([nn.Linear(1, 64) for _ in range(scalar_count)])
         
         # Combined fully connected layer 
-        self.combined_fc = nn.Linear(512 + scalar_count * 64, latent_image_size ** 2 * 1) # 1 channels
-        
-        # Batch normalization layer
-        #self.bn = nn.BatchNorm1d(latent_image_size ** 2 * 1)
+        self.combined_fc = nn.Linear(512 + scalar_count * 64, latent_image_size ** 2 * 1)
         
     def forward(self, vector1, vector2, scalars):
         # Process the vectors
@@ -522,23 +528,20 @@ class ExtEncoder(nn.Module):
         vectors_encoded = F.relu(self.vector_fc(vectors_combined))
 
         # Process each scalar individually
-        #print("Scalars shape:", scalars.shape)
         scalars_encoded = [F.relu(fc(scalar)) for fc, scalar in zip(self.scalar_fc, scalars.unbind(dim=2))]
         scalars_encoded = torch.cat(scalars_encoded, dim=1)
 
         # Combine the processed vectors and scalars
         combined = torch.cat((vectors_encoded, scalars_encoded), dim=1)
         
-        # Apply batch normalization
-        #normalized_output = self.bn(self.combined_fc(combined))
+        # Apply combined fully connected layer
         combined_output = self.combined_fc(combined)
 
-        # Apply sigmoid activation
+        # Apply ReLU activation
         latent_image = torch.relu(combined_output)
         
-        #latent_image = torch.sigmoid(self.combined_fc(combined))
-        #print("latent_image",latent_image.view(-1, 3, latent_image_size, latent_image_size).shape)
-        return latent_image.view(-1, 1, latent_image_size, latent_image_size) # 3 channels
+        # Use self.latent_image_size instead of latent_image_size
+        return latent_image.view(-1, 1, self.latent_image_size, self.latent_image_size)
 
     
 
@@ -899,17 +902,46 @@ def initialize_weights(model):
 
 def setup_training(encoderunet, unetdecoder, resume=0):
     lr = 1e-4
-    criterion = nn.MSELoss().to(device)  # Move criterion to MPS
+    criterion = nn.MSELoss().to(device)
+    scaler = GradScaler()
     
     if resume == 1:
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth', 
-                              map_location=device)
-        encoderunet.load_state_dict(checkpoint['encoderunet_state_dict'])
-        unetdecoder.load_state_dict(checkpoint['unetdecoder_state_dict'])
+        # Load checkpoint
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth', 
+                              map_location='cpu')
         
+        # Handle state dict for DDP models
+        encoderunet_state = {}
+        for k, v in checkpoint['encoderunet_state_dict'].items():
+            # Remove 'module.' if it exists (from DDP) or add if needed
+            if k.startswith('module.'):
+                encoderunet_state[k] = v
+            else:
+                encoderunet_state[f'module.{k}'] = v
+                
+        unetdecoder_state = {}
+        for k, v in checkpoint['unetdecoder_state_dict'].items():
+            if k.startswith('module.'):
+                unetdecoder_state[k] = v
+            else:
+                unetdecoder_state[f'module.{k}'] = v
+        
+        # Load state dicts
+        encoderunet.load_state_dict(encoderunet_state)
+        unetdecoder.load_state_dict(unetdecoder_state)
+        
+        # Move optimizer state to correct device after loading
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
                          lr=lr, weight_decay=1e-4)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        optimizer_state = checkpoint['optimizer_state_dict']
+        
+        # Ensure optimizer state tensors are on the correct device
+        for state in optimizer_state['state'].values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+                    
+        optimizer.load_state_dict(optimizer_state)
         
         start_epoch = checkpoint['epoch'] + 1
         train_losses = checkpoint['train_losses']
@@ -919,31 +951,48 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    else:
-        initialize_weights(unetdecoder)
-        initialize_weights(encoderunet)
         
+        # Handle scaler state
+        if 'scaler_state_dict' in checkpoint:
+            scaler_state = checkpoint['scaler_state_dict']
+            scaler.load_state_dict(scaler_state)
+        else:
+            scaler_state = None
+            
+        return (optimizer, scheduler, criterion, start_epoch, 
+                train_losses, val_losses, train_accuracies, 
+                val_accuracies, scaler)
+    else:
+        optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
+                         lr=lr, weight_decay=1e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
         start_epoch = 0
         train_losses = []
         val_losses = []
         train_accuracies = []
         val_accuracies = []
         
-        optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                         lr=lr, weight_decay=1e-4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
-    
-    return (optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, 
-            train_accuracies, val_accuracies)
+        return (optimizer, scheduler, criterion, start_epoch, 
+                train_losses, val_losses, train_accuracies, 
+                val_accuracies, scaler)
 
 
 # training_loop.py
 
-def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, resume=0):
-    # Setup training parameters
-    EPOCHS = 0
-    optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies = setup_training(encoderunet, unetdecoder, resume)
+def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0):
+    # Get training setup (now returns scaler instead of scaler_state)
+    optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies, scaler = setup_training(encoderunet, unetdecoder, resume)
+
+    # Remove this line since scaler is now directly returned from setup_training
+    # if scaler_state is not None:
+    #     scaler.load_state_dict(scaler_state)
+
+    # Get rank for printing
+    rank = dist.get_rank()
     
+    # Setup training parameters
+    EPOCHS = 600
+
     # Print settings
     print('SETTINGS')
     print('epochs:', EPOCHS)
@@ -951,20 +1000,25 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
     print('optimizer: Adam')
     print('learning rate:', optimizer.param_groups[0]['lr'])
     print('loss: weighted L1 + MSE')
+    print('using mixed precision training')
 
     sys.stdout.flush()
     
     line_length = 155
     
     for epoch in range(start_epoch, EPOCHS):
-        start_time = time.time()
-        
+        # Synchronize GPUs before starting epoch
+        torch.cuda.synchronize()
+        dist.barrier()
+
         # Training
         encoderunet.train()
         unetdecoder.train()
         
         running_train_losses = [0.0] * len(train_loaders)
         running_train_accuracies = [0.0] * len(train_loaders)
+        
+        start_time = time.time()
         
         for i, train_loader in enumerate(train_loaders):
             loader_loss_sum = 0.0
@@ -979,107 +1033,106 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                 arrays = arrays.squeeze(1)
                 arrays_p = arrays_p.squeeze(1)
                 
-                # Forward pass through encoder-unet
-                outputs = encoderunet(v1, v2, scalars)
-                #accuracy = calculate_gamma_index(outputs, arrays)
-                accuracy = 0
-                
-                # Compute "forward loss"
-                l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
-                l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                weight = 1/scalars[:,0,0]
-                loss_for = (l1_loss_per_sample * weight).mean()
-                
-                # First decoder pass
-                arrays_con = torch.cat([arrays_p, arrays], dim=1)
-                v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
-                
-                # Second encoder pass
-                outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1), 
-                                      v2_reconstructed.unsqueeze(1), 
-                                      scalars_reconstructed.unsqueeze(1))
-                
-                # Compute "second pass forward loss"
-                l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
-                l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
-                loss_for_2 = (l1_loss_per_sample * weight).mean()
-                
-                # Second decoder pass
-                arrays_p = outputs[:-1]
-                main_batch = outputs[1:]
-                arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
-                v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
-                
-                # Prepare tensors
-                v1, v2 = v1.squeeze(1), v2.squeeze(1)
-                v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
-                scalars = scalars.squeeze(1)
-                
-                # Penalty losses
-                penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
-                                         v1_reconstructed - v2_reconstructed,
-                                         torch.zeros_like(v2_reconstructed)).sum()
-                
-                penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
-                                           v1_reconstructed_2 - v2_reconstructed_2,
-                                           torch.zeros_like(v2_reconstructed_2)).sum()
-                
-                # Consistency losses
-                if v1_reconstructed.size(0) > 1:
-                    mse_loss_v1_diff = weighted_l1_loss(
-                        v1_reconstructed[:-1, -52:],
-                        v1_reconstructed[1:, :52],
-                        v1_weight[:-1, -52:]
-                    )
-                    mse_loss_v2_diff = weighted_l1_loss(
-                        v2_reconstructed[:-1, -52:],
-                        v2_reconstructed[1:, :52],
-                        v2_weight[:-1, -52:]
-                    )
-                    mse_loss_v1_diff_2 = weighted_l1_loss(
-                        v1_reconstructed_2[:-1, -52:],
-                        v1_reconstructed_2[1:, :52],
-                        v1_weight[1:-1, -52:]
-                    )
-                    mse_loss_v2_diff_2 = weighted_l1_loss(
-                        v2_reconstructed_2[:-1, -52:],
-                        v2_reconstructed_2[1:, :52],
-                        v2_weight[1:-1, -52:]
-                    )
+                # Wrap training steps with autocast
+                with autocast():
+                    # Forward pass through encoder-unet
+                    outputs = encoderunet(v1, v2, scalars)
+                    accuracy = 0
                     
-                    consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff + 
-                                      mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
+                    # Compute "forward loss"
+                    l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
+                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                    weight = 1/scalars[:,0,0]
+                    loss_for = (l1_loss_per_sample * weight).mean()
+                    
+                    # First decoder pass
+                    arrays_con = torch.cat([arrays_p, arrays], dim=1)
+                    v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
+                    
+                    # Second encoder pass
+                    outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1), 
+                                          v2_reconstructed.unsqueeze(1), 
+                                          scalars_reconstructed.unsqueeze(1))
+                    
+                    # Compute "second pass forward loss"
+                    l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
+                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                    weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
+                    loss_for_2 = (l1_loss_per_sample * weight).mean()
+                    
+                    # Second decoder pass
+                    arrays_p = outputs[:-1]
+                    main_batch = outputs[1:]
+                    arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
+                    v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
+                    
+                    # Prepare tensors
+                    v1, v2 = v1.squeeze(1), v2.squeeze(1)
+                    v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
+                    scalars = scalars.squeeze(1)
+                    
+                    # Penalty losses
+                    penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
+                                             v1_reconstructed - v2_reconstructed,
+                                             torch.zeros_like(v2_reconstructed)).sum()
+                    
+                    penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
+                                               v1_reconstructed_2 - v2_reconstructed_2,
+                                               torch.zeros_like(v2_reconstructed_2)).sum()
+                    
+                    # Consistency losses
+                    if v1_reconstructed.size(0) > 1:
+                        mse_loss_v1_diff = weighted_l1_loss(
+                            v1_reconstructed[:-1, -52:],
+                            v1_reconstructed[1:, :52],
+                            v1_weight[:-1, -52:]
+                        )
+                        mse_loss_v2_diff = weighted_l1_loss(
+                            v2_reconstructed[:-1, -52:],
+                            v2_reconstructed[1:, :52],
+                            v2_weight[:-1, -52:]
+                        )
+                        mse_loss_v1_diff_2 = weighted_l1_loss(
+                            v1_reconstructed_2[:-1, -52:],
+                            v1_reconstructed_2[1:, :52],
+                            v1_weight[1:-1, -52:]
+                        )
+                        mse_loss_v2_diff_2 = weighted_l1_loss(
+                            v2_reconstructed_2[:-1, -52:],
+                            v2_reconstructed_2[1:, :52],
+                            v2_weight[1:-1, -52:]
+                        )
+                        
+                        consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff +
+                                          mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
+                    
+                    # Reconstruction losses
+                    mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
+                    mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
+                    mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
+                    
+                    loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars +
+                                penalty_loss * 10)
+                    
+                    mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
+                    mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
+                    mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
+                    
+                    loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + mse_loss_scalars_2 +
+                                  penalty_loss_2 * 10)
+                    
+                    # Total loss
+                    loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
                 
-                # Reconstruction losses
-                mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
-                mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
-                mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
-                
-                loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars + 
-                            penalty_loss * 10)
-                
-                mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
-                mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
-                mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
-                
-                loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + mse_loss_scalars_2 + 
-                              penalty_loss_2 * 10)
-                
-                # Total loss
-                loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
-                
-                # Optimization step
+                # Optimization step with gradient scaling
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 
-                # Print progress
-                #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(train_loaders)}] "
-                #      f"Batch [{batch_idx+1}/{len(train_loader)}]  "
-                #      f"Temp. Train. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
-                #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
-                #      f"{loss.item():.2e}  Temp. Train. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
+                # Synchronize after optimization
+                torch.cuda.synchronize()
+                dist.barrier()
                 
                 loader_loss_sum += loss.item()
                 loader_accuracy_sum += accuracy
@@ -1094,7 +1147,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
         encoderunet.eval()
         unetdecoder.eval()
         
-        with torch.no_grad():
+        with torch.no_grad(), autocast():
             running_val_losses = [0.0] * len(val_loaders)
             running_val_accuracies = [0.0] * len(val_loaders)
             
@@ -1201,12 +1254,6 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                     # Total loss
                     loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
                     
-                    #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(val_loaders)}] "
-                    #      f"Batch [{batch_idx+1}/{len(val_loader)}]  "
-                    #      f"Temp. Val. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
-                    #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
-                    #      f"{loss.item():.2e}  Temp. Val. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
-                    
                     loader_loss_sum += loss.item()
                     loader_accuracy_sum += accuracy
                 
@@ -1223,10 +1270,10 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
         average_val_accuracy = sum(running_val_accuracies) / len(val_loaders)
 
         # Append to history
-        train_losses.append(average_train_loss)
-        train_accuracies.append(average_train_accuracy)
-        val_losses.append(average_val_loss)
-        val_accuracies.append(average_val_accuracy)
+        #train_losses.append(average_train_loss)
+        #train_accuracies.append(average_train_accuracy)
+        #val_losses.append(average_val_loss)
+        #val_accuracies.append(average_val_accuracy)
         
         # Step scheduler
         scheduler.step(epoch)
@@ -1235,91 +1282,158 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
         # Calculate elapsed time
         elapsed_time = time.time() - start_time
         
-        # Print epoch summary
-        print(f"Epoch [{epoch+1}/{EPOCHS}] "
-              f"Avg. Train Loss: {average_train_loss:.4e} "
-              f"Avg. Train Accuracy: {average_train_accuracy:.2f} "
-              f"Avg. Val. Loss: {average_val_loss:.4e} "
-              f"Avg. Val. Accuracy: {average_val_accuracy:.2f} "
-              f"Elap. Time: {elapsed_time:.1f} seconds "
-              f"Current LR: {current_lr:.4e}")
+        # Gather losses and accuracies from all GPUs
+        world_size = dist.get_world_size()
+        all_train_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
+        all_train_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
+        all_val_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
+        all_val_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
         
-        sys.stdout.flush()
+        # Convert local values to tensors
+        local_train_loss = torch.tensor([average_train_loss]).to(device)
+        local_train_acc = torch.tensor([average_train_accuracy]).to(device)
+        local_val_loss = torch.tensor([average_val_loss]).to(device)
+        local_val_acc = torch.tensor([average_val_accuracy]).to(device)
+        
+        # Gather from all GPUs
+        dist.all_gather(all_train_losses, local_train_loss)
+        dist.all_gather(all_train_accuracies, local_train_acc)
+        dist.all_gather(all_val_losses, local_val_loss)
+        dist.all_gather(all_val_accuracies, local_val_acc)
 
-        # Save checkpoint
-        checkpoint = {
-            'epoch': epoch,
-            'encoderunet_state_dict': encoderunet.state_dict(),
-            'unetdecoder_state_dict': unetdecoder.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'scheduler_state_dict': scheduler.state_dict(),
-            'train_losses': train_losses,
-            'train_accuracies': train_accuracies,
-            'val_losses': val_losses,
-            'val_accuracies': val_accuracies,
-        }
-        
-        #torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth')
+        # Calculate global averages
+        global_train_loss = sum([loss.item() for loss in all_train_losses]) / world_size
+        global_train_acc = sum([acc.item() for acc in all_train_accuracies]) / world_size
+        global_val_loss = sum([loss.item() for loss in all_val_losses]) / world_size
+        global_val_acc = sum([acc.item() for acc in all_val_accuracies]) / world_size
+
+        # Print epoch summary with global averages
+        if rank == 0:
+            print(f"Epoch [{epoch+1}/{EPOCHS}] "
+                  f"Avg. Train Loss: {global_train_loss:.4e} "
+                  f"Avg. Train Accuracy: {global_train_acc:.2f} "
+                  f"Avg. Val. Loss: {global_val_loss:.4e} "
+                  f"Avg. Val. Accuracy: {global_val_acc:.2f} "
+                  f"Elap. Time: {elapsed_time:.1f} seconds "
+                  f"Current LR: {current_lr:.4e}")
+            
+            sys.stdout.flush()
+
+        # Store global averages
+        train_losses.append(global_train_loss)
+        train_accuracies.append(global_train_acc)
+        val_losses.append(global_val_loss)
+        val_accuracies.append(global_val_acc)
+
+        # Only save checkpoint from rank 0
+        if rank == 0:
+            checkpoint = {
+                'epoch': epoch,
+                'encoderunet_state_dict': encoderunet.module.state_dict(),
+                'unetdecoder_state_dict': unetdecoder.module.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'scaler_state_dict': scaler.state_dict(),
+                'train_losses': train_losses,
+                'train_accuracies': train_accuracies,
+                'val_losses': val_losses,
+                'val_accuracies': val_accuracies,
+            }
+            
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
     #######################################################################
-if __name__ == "__main__":
-    # Load KM matrix
-    KM_data = scipy.io.loadmat('data/KM_1500.mat')
-    KM = KM_data['KM_1500']
 
-    # Set generation flag
-    generate_flag = 0  # Set this flag to 1 if you want to generate datasets again
 
-    # Create directories if they don't exist
-    os.makedirs("VMAT_Art_data", exist_ok=True)
-    os.makedirs("Cross_CP", exist_ok=True)
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
+    
+    dist.init_process_group(
+        "nccl", 
+        rank=rank, 
+        world_size=world_size,
+        timeout=timedelta(minutes=60)
+    )
+    
+    # Set device and CUDA settings
+    torch.cuda.set_device(rank)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False
 
+def cleanup():
+    dist.destroy_process_group()
+
+def train_ddp(rank, world_size, generate_flag, KM):
+    setup(rank, world_size)
+    
+    device = torch.device(f'cuda:{rank}')
+    
     train_loaders = []
     val_loaders = []
 
-    # Generate or load datasets
-    for dataset_num in range(320, 480, 1):
+    # Calculate dataset range for this rank
+    datasets_per_gpu = 640 // world_size
+    start_dataset = rank * datasets_per_gpu
+    end_dataset = start_dataset + datasets_per_gpu
+
+    # Generate or load datasets assigned to this GPU
+    for dataset_num in range(start_dataset, end_dataset):
         start_time = time.time()
 
         if generate_flag == 0:
             Art_dataset = load_dataset(dataset_num)
             if Art_dataset is None:
-                Art_dataset = generate_and_save_dataset(dataset_num)
-                print(f"Generated and saved dataset {dataset_num} because it was not found on disk")
+                Art_dataset = generate_and_save_dataset(dataset_num, KM)
+                print(f"[GPU {rank}] Generated and saved dataset {dataset_num} because it was not found on disk")
             else:
-                print(f"Loaded dataset {dataset_num} from disk")
+                print(f"[GPU {rank}] Loaded dataset {dataset_num} from disk")
         else:
-            Art_dataset = generate_and_save_dataset(dataset_num)
-            print(f"Generated and saved dataset {dataset_num}")
+            Art_dataset = generate_and_save_dataset(dataset_num, KM)
+            print(f"[GPU {rank}] Generated and saved dataset {dataset_num}")
 
-        sys.stdout.flush()
+        sys.stdout.flush()  # Ensure prints are flushed immediately
         
-        # Split into train and validation sets
+        # Split into train and validation sets (sequential split, no randomization)
         VALIDSPLIT = 0.8
         dataset_size = len(Art_dataset)
-        indices = list(range(dataset_size))
         split = int(np.floor(VALIDSPLIT * dataset_size))
-        train_indices, val_indices = indices[:split], indices[split:]
+        
+        # Sequential split
+        train_indices = list(range(split))
+        val_indices = list(range(split, dataset_size))
 
         train_ds = Subset(Art_dataset, train_indices)
         val_ds = Subset(Art_dataset, val_indices)
 
-        batch_size = 128
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        # Adjust batch size based on available GPU memory
+        batch_size = 256 // world_size  # Scale batch size by number of GPUs
+    
+
+        train_loader = DataLoader(
+            train_ds, 
+            batch_size=batch_size,
+            shuffle=False,  # Keep sequential order
+            pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_ds, 
+            batch_size=batch_size,
+            shuffle=False,
+            pin_memory=True
+        )
 
         train_loaders.append(train_loader)
         val_loaders.append(val_loader)
 
         end_time = time.time()
-        print(f"Dataset {dataset_num} processing time: {end_time - start_time:.2f} seconds")
-        print(f"Dataset {dataset_num} is done")
+        print(f"[GPU {rank}] Dataset {dataset_num} processing time: {end_time - start_time:.2f} seconds")
+        print(f"[GPU {rank}] Dataset {dataset_num} is done")
 
-
-
-    # Initialize your custom U-Net with the encoder
+    # Initialize models
     vector_dim = 104
     scalar_count = 5
     latent_image_size = 128
@@ -1327,10 +1441,11 @@ if __name__ == "__main__":
     out_channels = 1
     resize_out = 131
 
-    encoderunet = EncoderUNet(ExtEncoder, vector_dim, scalar_count, latent_image_size,in_channels, out_channels, resize_out, freeze_encoder=False)
-    encoderunet = encoderunet.to(device)  # Explicitly move to MPS
+    encoderunet = EncoderUNet(ExtEncoder, vector_dim, scalar_count, latent_image_size, 
+                             in_channels, out_channels, resize_out, freeze_encoder=False)
+    encoderunet = encoderunet.to(device)
+    encoderunet = DDP(encoderunet, device_ids=[rank])
 
-    # Initialize your custom U-Net with the encoder
     vector_dim = 104
     scalar_count = 5
     latent_image_size = 128
@@ -1338,13 +1453,41 @@ if __name__ == "__main__":
     out_channels = 1
     resize_in = 128
 
-    unetdecoder = UNetDecoder(ExtDecoder, vector_dim, scalar_count, latent_image_size,in_channels, out_channels, resize_in,freeze_encoder=False)
-    unetdecoder = unetdecoder.to(device)  # Explicitly move to MPS
+    unetdecoder = UNetDecoder(ExtDecoder, vector_dim, scalar_count, latent_image_size,
+                             in_channels, out_channels, resize_in, freeze_encoder=False)
+    unetdecoder = unetdecoder.to(device)
+    unetdecoder = DDP(unetdecoder, device_ids=[rank])
 
-    print("\nModel devices:")
-    print(f"encoderunet device: {next(encoderunet.parameters()).device}")
-    print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
-    # Start training
-    print("Starting training...")
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, resume=0)
-    print("Training completed!")
+    if rank == 0:
+        print("\nModel devices:")
+        print(f"encoderunet device: {next(encoderunet.parameters()).device}")
+        print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
+        print("Starting training...")
+    
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
+    
+    if rank == 0:
+        print("Training completed!")
+    
+    cleanup()
+
+if __name__ == "__main__":
+    # Load KM matrix
+    KM_data = scipy.io.loadmat('data/KM_1500.mat')
+    KM = KM_data['KM_1500']
+
+    # Create directories if they don't exist
+    os.makedirs("VMAT_Art_data", exist_ok=True)
+    os.makedirs("Cross_CP", exist_ok=True)
+
+    # Set generation flag
+    generate_flag = 0  # Set this flag to 1 if you want to generate datasets again
+
+    # Launch training on 2 GPUs
+    world_size = 2
+    mp.spawn(
+        train_ddp,
+        args=(world_size, generate_flag, KM),
+        nprocs=world_size,
+        join=True
+    )

@@ -42,7 +42,7 @@ import matplotlib.pyplot as plt
 
 import os
 
-
+from torch.cuda.amp import autocast, GradScaler
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -327,7 +327,7 @@ def create_boundary_matrix(vector1, vector2, scalar1, scalar2, scalar3):
         
         # Rotate matrix
         matrix = np.flipud(matrix)
-        rotated_matrix = scipy.ndimage.rotate(matrix, 0, reshape=False, mode='constant', cval=0.0)
+        rotated_matrix = scipy.ndimage.rotate(matrix, 45, reshape=False, mode='constant', cval=0.0)
         matrix_collection.append(rotated_matrix)
 
     return matrix_collection
@@ -402,12 +402,12 @@ class CustomDataset(Dataset):
 def save_dataset(dataset, dataset_num):
     """Function to save dataset"""
     os.makedirs("VMAT_Art_data", exist_ok=True)
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
+    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll45_{dataset_num}.pt")
     torch.save(dataset, filename)
 
 def load_dataset(dataset_num):
     """Function to load dataset"""
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
+    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll45_{dataset_num}.pt")
     if os.path.exists(filename):
         try:
             return torch.load(filename)
@@ -899,10 +899,10 @@ def initialize_weights(model):
 
 def setup_training(encoderunet, unetdecoder, resume=0):
     lr = 1e-4
-    criterion = nn.MSELoss().to(device)  # Move criterion to MPS
+    criterion = nn.MSELoss().to(device)
     
     if resume == 1:
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth', 
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_LossA_coll45_checkpoint.pth', 
                               map_location=device)
         encoderunet.load_state_dict(checkpoint['encoderunet_state_dict'])
         unetdecoder.load_state_dict(checkpoint['unetdecoder_state_dict'])
@@ -917,8 +917,11 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         train_accuracies = checkpoint['train_accuracies']
         val_accuracies = checkpoint['val_accuracies']
         
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=1.5, eta_min=1e-5)
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Return the scaler state dict for loading in train_cross
+        scaler_state = checkpoint.get('scaler_state_dict', None)
     else:
         initialize_weights(unetdecoder)
         initialize_weights(encoderunet)
@@ -931,18 +934,24 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
                          lr=lr, weight_decay=1e-4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=5, T_mult=1.5, eta_min=1e-5)
+        scaler_state = None
     
-    return (optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, 
-            train_accuracies, val_accuracies)
+    return (optimizer, scheduler, criterion, start_epoch, train_losses, val_losses,
+            train_accuracies, val_accuracies, scaler_state)
 
 
 # training_loop.py
 
 def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, resume=0):
     # Setup training parameters
-    EPOCHS = 0
-    optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies = setup_training(encoderunet, unetdecoder, resume)
+    EPOCHS = 300
+    optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies, scaler_state = setup_training(encoderunet, unetdecoder, resume)
+    
+    # Initialize gradient scaler for AMP
+    scaler = GradScaler()
+    if scaler_state is not None:
+        scaler.load_state_dict(scaler_state)
     
     # Print settings
     print('SETTINGS')
@@ -951,6 +960,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
     print('optimizer: Adam')
     print('learning rate:', optimizer.param_groups[0]['lr'])
     print('loss: weighted L1 + MSE')
+    print('using mixed precision training')
 
     sys.stdout.flush()
     
@@ -979,100 +989,102 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                 arrays = arrays.squeeze(1)
                 arrays_p = arrays_p.squeeze(1)
                 
-                # Forward pass through encoder-unet
-                outputs = encoderunet(v1, v2, scalars)
-                #accuracy = calculate_gamma_index(outputs, arrays)
-                accuracy = 0
-                
-                # Compute "forward loss"
-                l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
-                l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                weight = 1/scalars[:,0,0]
-                loss_for = (l1_loss_per_sample * weight).mean()
-                
-                # First decoder pass
-                arrays_con = torch.cat([arrays_p, arrays], dim=1)
-                v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
-                
-                # Second encoder pass
-                outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1), 
-                                      v2_reconstructed.unsqueeze(1), 
-                                      scalars_reconstructed.unsqueeze(1))
-                
-                # Compute "second pass forward loss"
-                l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
-                l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
-                loss_for_2 = (l1_loss_per_sample * weight).mean()
-                
-                # Second decoder pass
-                arrays_p = outputs[:-1]
-                main_batch = outputs[1:]
-                arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
-                v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
-                
-                # Prepare tensors
-                v1, v2 = v1.squeeze(1), v2.squeeze(1)
-                v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
-                scalars = scalars.squeeze(1)
-                
-                # Penalty losses
-                penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
-                                         v1_reconstructed - v2_reconstructed,
-                                         torch.zeros_like(v2_reconstructed)).sum()
-                
-                penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
-                                           v1_reconstructed_2 - v2_reconstructed_2,
-                                           torch.zeros_like(v2_reconstructed_2)).sum()
-                
-                # Consistency losses
-                if v1_reconstructed.size(0) > 1:
-                    mse_loss_v1_diff = weighted_l1_loss(
-                        v1_reconstructed[:-1, -52:],
-                        v1_reconstructed[1:, :52],
-                        v1_weight[:-1, -52:]
-                    )
-                    mse_loss_v2_diff = weighted_l1_loss(
-                        v2_reconstructed[:-1, -52:],
-                        v2_reconstructed[1:, :52],
-                        v2_weight[:-1, -52:]
-                    )
-                    mse_loss_v1_diff_2 = weighted_l1_loss(
-                        v1_reconstructed_2[:-1, -52:],
-                        v1_reconstructed_2[1:, :52],
-                        v1_weight[1:-1, -52:]
-                    )
-                    mse_loss_v2_diff_2 = weighted_l1_loss(
-                        v2_reconstructed_2[:-1, -52:],
-                        v2_reconstructed_2[1:, :52],
-                        v2_weight[1:-1, -52:]
-                    )
+                # Wrap training steps with autocast
+                with autocast():
+                    # Forward pass through encoder-unet
+                    outputs = encoderunet(v1, v2, scalars)
+                    accuracy = 0
                     
-                    consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff + 
-                                      mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
+                    # Compute "forward loss"
+                    l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
+                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                    weight = 1/scalars[:,0,0]
+                    loss_for = (l1_loss_per_sample * weight).mean()
+                    
+                    # First decoder pass
+                    arrays_con = torch.cat([arrays_p, arrays], dim=1)
+                    v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
+                    
+                    # Second encoder pass
+                    outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1), 
+                                          v2_reconstructed.unsqueeze(1), 
+                                          scalars_reconstructed.unsqueeze(1))
+                    
+                    # Compute "second pass forward loss"
+                    l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
+                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                    weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
+                    loss_for_2 = (l1_loss_per_sample * weight).mean()
+                    
+                    # Second decoder pass
+                    arrays_p = outputs[:-1]
+                    main_batch = outputs[1:]
+                    arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
+                    v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
+                    
+                    # Prepare tensors
+                    v1, v2 = v1.squeeze(1), v2.squeeze(1)
+                    v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
+                    scalars = scalars.squeeze(1)
+                    
+                    # Penalty losses
+                    penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
+                                             v1_reconstructed - v2_reconstructed,
+                                             torch.zeros_like(v2_reconstructed)).sum()
+                    
+                    penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
+                                               v1_reconstructed_2 - v2_reconstructed_2,
+                                               torch.zeros_like(v2_reconstructed_2)).sum()
+                    
+                    # Consistency losses
+                    if v1_reconstructed.size(0) > 1:
+                        mse_loss_v1_diff = weighted_l1_loss(
+                            v1_reconstructed[:-1, -52:],
+                            v1_reconstructed[1:, :52],
+                            v1_weight[:-1, -52:]
+                        )
+                        mse_loss_v2_diff = weighted_l1_loss(
+                            v2_reconstructed[:-1, -52:],
+                            v2_reconstructed[1:, :52],
+                            v2_weight[:-1, -52:]
+                        )
+                        mse_loss_v1_diff_2 = weighted_l1_loss(
+                            v1_reconstructed_2[:-1, -52:],
+                            v1_reconstructed_2[1:, :52],
+                            v1_weight[1:-1, -52:]
+                        )
+                        mse_loss_v2_diff_2 = weighted_l1_loss(
+                            v2_reconstructed_2[:-1, -52:],
+                            v2_reconstructed_2[1:, :52],
+                            v2_weight[1:-1, -52:]
+                        )
+                        
+                        consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff +
+                                          mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
+                    
+                    # Reconstruction losses
+                    mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
+                    mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
+                    mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
+                    
+                    loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars +
+                                penalty_loss * 10)
+                    
+                    mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
+                    mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
+                    mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
+                    
+                    loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + mse_loss_scalars_2 +
+                                  penalty_loss_2 * 10)
+                    
+                    # Total loss
+                    loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
                 
-                # Reconstruction losses
-                mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
-                mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
-                mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
-                
-                loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars + 
-                            penalty_loss * 10)
-                
-                mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
-                mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
-                mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
-                
-                loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + mse_loss_scalars_2 + 
-                              penalty_loss_2 * 10)
-                
-                # Total loss
-                loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
-                
-                # Optimization step
+                # Optimization step with gradient scaling
                 optimizer.zero_grad()
-                loss.backward()
-                optimizer.step()
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
                 
                 # Print progress
                 #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(train_loaders)}] "
@@ -1094,7 +1106,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
         encoderunet.eval()
         unetdecoder.eval()
         
-        with torch.no_grad():
+        with torch.no_grad(), autocast():
             running_val_losses = [0.0] * len(val_loaders)
             running_val_accuracies = [0.0] * len(val_loaders)
             
@@ -1246,20 +1258,21 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
         
         sys.stdout.flush()
 
-        # Save checkpoint
+        # Save checkpoint with scaler state
         checkpoint = {
             'epoch': epoch,
             'encoderunet_state_dict': encoderunet.state_dict(),
             'unetdecoder_state_dict': unetdecoder.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'scheduler_state_dict': scheduler.state_dict(),
+            'scaler_state_dict': scaler.state_dict(),  # Save scaler state
             'train_losses': train_losses,
             'train_accuracies': train_accuracies,
             'val_losses': val_losses,
             'val_accuracies': val_accuracies,
         }
         
-        #torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth')
+        torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_LossA_coll45_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1280,7 +1293,7 @@ if __name__ == "__main__":
     val_loaders = []
 
     # Generate or load datasets
-    for dataset_num in range(320, 480, 1):
+    for dataset_num in range(0, 640, 1):
         start_time = time.time()
 
         if generate_flag == 0:

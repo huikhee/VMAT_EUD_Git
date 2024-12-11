@@ -327,7 +327,7 @@ def create_boundary_matrix(vector1, vector2, scalar1, scalar2, scalar3):
         
         # Rotate matrix
         matrix = np.flipud(matrix)
-        rotated_matrix = scipy.ndimage.rotate(matrix, 0, reshape=False, mode='constant', cval=0.0)
+        rotated_matrix = scipy.ndimage.rotate(matrix, 45, reshape=False, mode='constant', cval=0.0)
         matrix_collection.append(rotated_matrix)
 
     return matrix_collection
@@ -402,12 +402,12 @@ class CustomDataset(Dataset):
 def save_dataset(dataset, dataset_num):
     """Function to save dataset"""
     os.makedirs("VMAT_Art_data", exist_ok=True)
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
+    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll45_{dataset_num}.pt")
     torch.save(dataset, filename)
 
 def load_dataset(dataset_num):
     """Function to load dataset"""
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
+    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll45_{dataset_num}.pt")
     if os.path.exists(filename):
         try:
             return torch.load(filename)
@@ -941,7 +941,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
 
 def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, resume=0):
     # Setup training parameters
-    EPOCHS = 0
+    EPOCHS = 1
     optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies = setup_training(encoderunet, unetdecoder, resume)
     
     # Print settings
@@ -1259,7 +1259,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
             'val_accuracies': val_accuracies,
         }
         
-        #torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth')
+        torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1280,7 +1280,7 @@ if __name__ == "__main__":
     val_loaders = []
 
     # Generate or load datasets
-    for dataset_num in range(320, 480, 1):
+    for dataset_num in range(0, 640, 1):
         start_time = time.time()
 
         if generate_flag == 0:
