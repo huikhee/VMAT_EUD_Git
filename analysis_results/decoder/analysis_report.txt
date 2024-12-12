@@ -1,0 +1,934 @@
+Analysis Report for decoder
+==================================================
+
+
+Loss Analysis:
+--------------------------------------------------
+reconstruction_loss_v1: 159.624664
+reconstruction_loss_v2: 142.546295
+reconstruction_loss_scalars: 14292.503906
+penalty_loss: 966492.312500
+total_loss: 9679518.000000
+
+Weight Analysis for decoder:
+--------------------------------------------------
+
+Layer: extdecoder.fc.weight
+Shape: [512, 16384]
+Parameters: 8,388,608
+Mean: -0.002289
+Std: 0.084117
+Max: 1.436474
+Min: -1.908003
+
+Layer: extdecoder.fc.bias
+Shape: [512]
+Parameters: 512
+Mean: 0.052071
+Std: 0.089133
+Max: 0.264563
+Min: -0.373377
+
+Layer: extdecoder.vector_fc1.weight
+Shape: [104, 512]
+Parameters: 53,248
+Mean: -0.000151
+Std: 0.139980
+Max: 1.834971
+Min: -1.703385
+
+Layer: extdecoder.vector_fc1.bias
+Shape: [104]
+Parameters: 104
+Mean: -0.028614
+Std: 0.041883
+Max: 0.064146
+Min: -0.109188
+
+Layer: extdecoder.vector_fc2.weight
+Shape: [104, 512]
+Parameters: 53,248
+Mean: -0.002287
+Std: 0.117410
+Max: 1.311763
+Min: -1.148344
+
+Layer: extdecoder.vector_fc2.bias
+Shape: [104]
+Parameters: 104
+Mean: 0.031871
+Std: 0.046191
+Max: 0.107291
+Min: -0.065941
+
+Layer: extdecoder.scalar_fc.weight
+Shape: [5, 512]
+Parameters: 2,560
+Mean: 0.001230
+Std: 0.091698
+Max: 0.752491
+Min: -0.864797
+
+Layer: extdecoder.scalar_fc.bias
+Shape: [5]
+Parameters: 5
+Mean: 0.085716
+Std: 0.194082
+Max: 0.284196
+Min: -0.114264
+
+Layer: unet2.encoder1.conv_block.conv1.weight
+Shape: [32, 2, 3, 3]
+Parameters: 576
+Mean: -0.003704
+Std: 0.095703
+Max: 0.420590
+Min: -0.357351
+
+Layer: unet2.encoder1.conv_block.conv1.bias
+Shape: [32]
+Parameters: 32
+Mean: -0.005513
+Std: 0.012724
+Max: 0.011470
+Min: -0.052430
+
+Layer: unet2.encoder1.conv_block.conv2.weight
+Shape: [32, 32, 3, 3]
+Parameters: 9,216
+Mean: -0.004581
+Std: 0.099628
+Max: 0.341828
+Min: -0.840003
+
+Layer: unet2.encoder1.conv_block.conv2.bias
+Shape: [32]
+Parameters: 32
+Mean: -0.008565
+Std: 0.012963
+Max: 0.007375
+Min: -0.048328
+
+Layer: unet2.encoder2.conv_block.conv1.weight
+Shape: [64, 32, 3, 3]
+Parameters: 18,432
+Mean: -0.010643
+Std: 0.090744
+Max: 0.413223
+Min: -0.991847
+
+Layer: unet2.encoder2.conv_block.conv1.bias
+Shape: [64]
+Parameters: 64
+Mean: 0.006614
+Std: 0.013538
+Max: 0.042216
+Min: -0.051056
+
+Layer: unet2.encoder2.conv_block.conv2.weight
+Shape: [64, 64, 3, 3]
+Parameters: 36,864
+Mean: -0.005415
+Std: 0.079165
+Max: 0.524465
+Min: -0.553222
+
+Layer: unet2.encoder2.conv_block.conv2.bias
+Shape: [64]
+Parameters: 64
+Mean: 0.011933
+Std: 0.016035
+Max: 0.070839
+Min: -0.029225
+
+Layer: unet2.encoder3.conv_block.conv1.weight
+Shape: [128, 64, 3, 3]
+Parameters: 73,728
+Mean: -0.007800
+Std: 0.074536
+Max: 0.450087
+Min: -0.612173
+
+Layer: unet2.encoder3.conv_block.conv1.bias
+Shape: [128]
+Parameters: 128
+Mean: 0.014436
+Std: 0.047658
+Max: 0.072267
+Min: -0.350115
+
+Layer: unet2.encoder3.conv_block.conv2.weight
+Shape: [128, 128, 3, 3]
+Parameters: 147,456
+Mean: -0.010097
+Std: 0.077183
+Max: 0.417578
+Min: -0.680620
+
+Layer: unet2.encoder3.conv_block.conv2.bias
+Shape: [128]
+Parameters: 128
+Mean: 0.023218
+Std: 0.023499
+Max: 0.095399
+Min: -0.051708
+
+Layer: unet2.bottleneck.conv1.weight
+Shape: [256, 128, 3, 3]
+Parameters: 294,912
+Mean: -0.009777
+Std: 0.081464
+Max: 0.530198
+Min: -1.073137
+
+Layer: unet2.bottleneck.conv1.bias
+Shape: [256]
+Parameters: 256
+Mean: 0.000752
+Std: 0.029339
+Max: 0.052271
+Min: -0.252819
+
+Layer: unet2.bottleneck.conv2.weight
+Shape: [256, 256, 3, 3]
+Parameters: 589,824
+Mean: -0.008220
+Std: 0.074365
+Max: 0.431947
+Min: -1.640996
+
+Layer: unet2.bottleneck.conv2.bias
+Shape: [256]
+Parameters: 256
+Mean: 0.016031
+Std: 0.049240
+Max: 0.109446
+Min: -0.488985
+
+Layer: unet2.decoder3.conv_transpose.weight
+Shape: [256, 128, 2, 2]
+Parameters: 131,072
+Mean: -0.001821
+Std: 0.064899
+Max: 0.435337
+Min: -0.406625
+
+Layer: unet2.decoder3.conv_transpose.bias
+Shape: [128]
+Parameters: 128
+Mean: 0.007280
+Std: 0.011549
+Max: 0.042925
+Min: -0.025462
+
+Layer: unet2.decoder3.conv_block.conv1.weight
+Shape: [128, 256, 3, 3]
+Parameters: 294,912
+Mean: -0.002952
+Std: 0.063609
+Max: 0.380974
+Min: -0.520734
+
+Layer: unet2.decoder3.conv_block.conv1.bias
+Shape: [128]
+Parameters: 128
+Mean: -0.016054
+Std: 0.037713
+Max: 0.044212
+Min: -0.231622
+
+Layer: unet2.decoder3.conv_block.conv2.weight
+Shape: [128, 128, 3, 3]
+Parameters: 147,456
+Mean: -0.005545
+Std: 0.063931
+Max: 0.321209
+Min: -1.052036
+
+Layer: unet2.decoder3.conv_block.conv2.bias
+Shape: [128]
+Parameters: 128
+Mean: 0.031330
+Std: 0.032292
+Max: 0.118882
+Min: -0.056435
+
+Layer: unet2.decoder2.conv_transpose.weight
+Shape: [128, 64, 2, 2]
+Parameters: 32,768
+Mean: -0.001754
+Std: 0.068420
+Max: 0.393076
+Min: -0.287612
+
+Layer: unet2.decoder2.conv_transpose.bias
+Shape: [64]
+Parameters: 64
+Mean: 0.013710
+Std: 0.027274
+Max: 0.091081
+Min: -0.050920
+
+Layer: unet2.decoder2.conv_block.conv1.weight
+Shape: [64, 128, 3, 3]
+Parameters: 73,728
+Mean: -0.001876
+Std: 0.066509
+Max: 0.339478
+Min: -0.499489
+
+Layer: unet2.decoder2.conv_block.conv1.bias
+Shape: [64]
+Parameters: 64
+Mean: -0.003369
+Std: 0.055043
+Max: 0.057095
+Min: -0.360626
+
+Layer: unet2.decoder2.conv_block.conv2.weight
+Shape: [64, 64, 3, 3]
+Parameters: 36,864
+Mean: -0.004913
+Std: 0.066450
+Max: 0.279017
+Min: -0.326631
+
+Layer: unet2.decoder2.conv_block.conv2.bias
+Shape: [64]
+Parameters: 64
+Mean: 0.038897
+Std: 0.034827
+Max: 0.110998
+Min: -0.046920
+
+Layer: unet2.decoder1.conv_transpose.weight
+Shape: [64, 32, 2, 2]
+Parameters: 8,192
+Mean: -0.000228
+Std: 0.087864
+Max: 0.346820
+Min: -0.372516
+
+Layer: unet2.decoder1.conv_transpose.bias
+Shape: [32]
+Parameters: 32
+Mean: 0.001248
+Std: 0.023278
+Max: 0.039987
+Min: -0.041030
+
+Layer: unet2.decoder1.conv_block.conv1.weight
+Shape: [32, 64, 3, 3]
+Parameters: 18,432
+Mean: -0.002603
+Std: 0.083766
+Max: 0.381147
+Min: -0.564376
+
+Layer: unet2.decoder1.conv_block.conv1.bias
+Shape: [32]
+Parameters: 32
+Mean: -0.018936
+Std: 0.028831
+Max: 0.034104
+Min: -0.071603
+
+Layer: unet2.decoder1.conv_block.conv2.weight
+Shape: [32, 32, 3, 3]
+Parameters: 9,216
+Mean: -0.004590
+Std: 0.087107
+Max: 0.333725
+Min: -0.335947
+
+Layer: unet2.decoder1.conv_block.conv2.bias
+Shape: [32]
+Parameters: 32
+Mean: 0.014924
+Std: 0.033152
+Max: 0.068721
+Min: -0.052638
+
+Layer: unet2.final_conv.weight
+Shape: [1, 32, 1, 1]
+Parameters: 32
+Mean: 0.067838
+Std: 1.311296
+Max: 3.004953
+Min: -2.130763
+
+Layer: unet2.final_conv.bias
+Shape: [1]
+Parameters: 1
+Mean: 0.065754
+Std: nan
+Max: 0.065754
+Min: 0.065754
+
+Total Parameters: 10,423,702
+Trainable Parameters: 10,423,702
+
+Activation Analysis:
+--------------------------------------------------
+
+Layer: unet2.encoder1.conv_block.conv1
+Shape: [32, 32, 128, 128]
+Mean: -0.005509
+Std: 0.266983
+Max: 2.364856
+Min: -2.517505
+
+Layer: unet2.encoder1.conv_block.relu1
+Shape: [32, 32, 128, 128]
+Mean: 0.097721
+Std: 0.157520
+Max: 2.364856
+Min: 0.000000
+Dead Units: 50.83%
+
+Layer: unet2.encoder1.conv_block.conv2
+Shape: [32, 32, 128, 128]
+Mean: -0.138948
+Std: 0.399321
+Max: 3.185026
+Min: -3.112512
+
+Layer: unet2.encoder1.conv_block.relu2
+Shape: [32, 32, 128, 128]
+Mean: 0.092403
+Std: 0.188105
+Max: 3.185026
+Min: 0.000000
+Dead Units: 64.87%
+
+Layer: unet2.encoder2.conv_block.conv1
+Shape: [32, 64, 64, 64]
+Mean: -0.718338
+Std: 1.280267
+Max: 4.838307
+Min: -12.339504
+
+Layer: unet2.encoder2.conv_block.relu1
+Shape: [32, 64, 64, 64]
+Mean: 0.204374
+Std: 0.478913
+Max: 4.838307
+Min: 0.000000
+Dead Units: 74.52%
+
+Layer: unet2.encoder2.conv_block.conv2
+Shape: [32, 64, 64, 64]
+Mean: -0.720737
+Std: 1.418147
+Max: 6.840510
+Min: -13.138076
+
+Layer: unet2.encoder2.conv_block.relu2
+Shape: [32, 64, 64, 64]
+Mean: 0.229235
+Std: 0.645213
+Max: 6.840510
+Min: 0.000000
+Dead Units: 80.31%
+
+Layer: unet2.encoder3.conv_block.conv1
+Shape: [32, 128, 32, 32]
+Mean: -1.693439
+Std: 2.174649
+Max: 9.109412
+Min: -16.811981
+
+Layer: unet2.encoder3.conv_block.relu1
+Shape: [32, 128, 32, 32]
+Mean: 0.175035
+Std: 0.637426
+Max: 9.109412
+Min: 0.000000
+Dead Units: 81.83%
+
+Layer: unet2.encoder3.conv_block.conv2
+Shape: [32, 128, 32, 32]
+Mean: -2.750993
+Std: 2.508984
+Max: 5.174827
+Min: -17.993671
+
+Layer: unet2.encoder3.conv_block.relu2
+Shape: [32, 128, 32, 32]
+Mean: 0.094073
+Std: 0.407557
+Max: 5.174827
+Min: 0.000000
+Dead Units: 90.03%
+
+Layer: unet2.bottleneck.conv1
+Shape: [32, 256, 16, 16]
+Mean: -2.054309
+Std: 1.806372
+Max: 3.866759
+Min: -12.949136
+
+Layer: unet2.bottleneck.relu1
+Shape: [32, 256, 16, 16]
+Mean: 0.056692
+Std: 0.245210
+Max: 3.866759
+Min: 0.000000
+Dead Units: 91.16%
+
+Layer: unet2.bottleneck.conv2
+Shape: [32, 256, 16, 16]
+Mean: -0.948730
+Std: 1.196967
+Max: 3.374304
+Min: -11.227886
+
+Layer: unet2.bottleneck.relu2
+Shape: [32, 256, 16, 16]
+Mean: 0.099362
+Std: 0.293041
+Max: 3.374304
+Min: 0.000000
+Dead Units: 81.43%
+
+Layer: unet2.decoder3.conv_block.conv1
+Shape: [32, 128, 32, 32]
+Mean: -1.554033
+Std: 1.643380
+Max: 4.797679
+Min: -11.580264
+
+Layer: unet2.decoder3.conv_block.relu1
+Shape: [32, 128, 32, 32]
+Mean: 0.111288
+Std: 0.361969
+Max: 4.797679
+Min: 0.000000
+Dead Units: 84.58%
+
+Layer: unet2.decoder3.conv_block.conv2
+Shape: [32, 128, 32, 32]
+Mean: -0.803372
+Std: 1.037040
+Max: 4.319569
+Min: -8.560846
+
+Layer: unet2.decoder3.conv_block.relu2
+Shape: [32, 128, 32, 32]
+Mean: 0.099699
+Std: 0.265955
+Max: 4.319569
+Min: 0.000000
+Dead Units: 78.97%
+
+Layer: unet2.decoder2.conv_block.conv1
+Shape: [32, 64, 64, 64]
+Mean: -1.006511
+Std: 1.892494
+Max: 5.668026
+Min: -11.463947
+
+Layer: unet2.decoder2.conv_block.relu1
+Shape: [32, 64, 64, 64]
+Mean: 0.320712
+Std: 0.641715
+Max: 5.668026
+Min: 0.000000
+Dead Units: 68.26%
+
+Layer: unet2.decoder2.conv_block.conv2
+Shape: [32, 64, 64, 64]
+Mean: -0.775755
+Std: 1.351151
+Max: 3.713888
+Min: -8.682322
+
+Layer: unet2.decoder2.conv_block.relu2
+Shape: [32, 64, 64, 64]
+Mean: 0.208830
+Std: 0.432533
+Max: 3.713888
+Min: 0.000000
+Dead Units: 71.09%
+
+Layer: unet2.decoder1.conv_block.conv1
+Shape: [32, 32, 128, 128]
+Mean: -0.336547
+Std: 0.618722
+Max: 3.915498
+Min: -5.647809
+
+Layer: unet2.decoder1.conv_block.relu1
+Shape: [32, 32, 128, 128]
+Mean: 0.104898
+Std: 0.227448
+Max: 3.915498
+Min: 0.000000
+Dead Units: 70.41%
+
+Layer: unet2.decoder1.conv_block.conv2
+Shape: [32, 32, 128, 128]
+Mean: -0.032334
+Std: 0.411198
+Max: 3.868847
+Min: -4.487847
+
+Layer: unet2.decoder1.conv_block.relu2
+Shape: [32, 32, 128, 128]
+Mean: 0.143679
+Std: 0.222826
+Max: 3.868847
+Min: 0.000000
+Dead Units: 51.39%
+
+Layer: unet2.final_conv
+Shape: [32, 1, 128, 128]
+Mean: -0.487841
+Std: 1.904324
+Max: 31.302412
+Min: -8.398603
+
+Layer: unet2.final_ReLU
+Shape: [32, 1, 128, 128]
+Mean: 0.488225
+Std: 1.311990
+Max: 31.302412
+Min: 0.000000
+Dead Units: 71.14%
+
+Gradient Analysis:
+--------------------------------------------------
+
+Layer: extdecoder.fc.weight
+Gradient Mean: 1.287669
+Gradient Std: 13.257636
+Gradient Max: 2752.685791
+Gradient Min: -293.126953
+Gradient Norm: 38578.902344
+
+Layer: extdecoder.fc.bias
+Gradient Mean: 2.638124
+Gradient Std: 17.546404
+Gradient Max: 294.626862
+Gradient Min: -35.375645
+Gradient Norm: 401.108673
+
+Layer: extdecoder.vector_fc1.weight
+Gradient Mean: 57.339375
+Gradient Std: 119.671883
+Gradient Max: 1682.065186
+Gradient Min: -399.763702
+Gradient Norm: 30620.880859
+
+Layer: extdecoder.vector_fc1.bias
+Gradient Mean: 2.940503
+Gradient Std: 2.206488
+Gradient Max: 7.787494
+Gradient Min: -1.853863
+Gradient Norm: 37.426014
+
+Layer: extdecoder.vector_fc2.weight
+Gradient Mean: -50.066380
+Gradient Std: 100.520439
+Gradient Max: 437.617340
+Gradient Min: -1351.864502
+Gradient Norm: 25913.324219
+
+Layer: extdecoder.vector_fc2.bias
+Gradient Mean: -2.561539
+Gradient Std: 1.755730
+Gradient Max: 2.033971
+Gradient Min: -6.261151
+Gradient Norm: 31.621208
+
+Layer: extdecoder.scalar_fc.weight
+Gradient Mean: 262.569946
+Gradient Std: 636.876160
+Gradient Max: 7626.637695
+Gradient Min: -348.310364
+Gradient Norm: 34849.007812
+
+Layer: extdecoder.scalar_fc.bias
+Gradient Mean: 13.552680
+Gradient Std: 14.979514
+Gradient Max: 35.425507
+Gradient Min: -1.618789
+Gradient Norm: 42.613602
+
+Layer: unet2.encoder1.conv_block.conv1.weight
+Gradient Mean: 3103.627686
+Gradient Std: 17530.744141
+Gradient Max: 97936.976562
+Gradient Min: -45324.558594
+Gradient Norm: 426920.750000
+
+Layer: unet2.encoder1.conv_block.conv1.bias
+Gradient Mean: -2148.189209
+Gradient Std: 69206.539062
+Gradient Max: 128681.359375
+Gradient Min: -161303.234375
+Gradient Norm: 385517.250000
+
+Layer: unet2.encoder1.conv_block.conv2.weight
+Gradient Mean: 1479.286133
+Gradient Std: 6102.684570
+Gradient Max: 41674.628906
+Gradient Min: -33236.945312
+Gradient Norm: 602792.937500
+
+Layer: unet2.encoder1.conv_block.conv2.bias
+Gradient Mean: 13189.141602
+Gradient Std: 56202.683594
+Gradient Max: 141295.296875
+Gradient Min: -142202.093750
+Gradient Norm: 321694.718750
+
+Layer: unet2.encoder2.conv_block.conv1.weight
+Gradient Mean: -857.696106
+Gradient Std: 6061.982422
+Gradient Max: 23469.332031
+Gradient Min: -53416.937500
+Gradient Norm: 831176.875000
+
+Layer: unet2.encoder2.conv_block.conv1.bias
+Gradient Mean: -3740.499023
+Gradient Std: 21729.955078
+Gradient Max: 36923.695312
+Gradient Min: -90791.726562
+Gradient Norm: 175052.781250
+
+Layer: unet2.encoder2.conv_block.conv2.weight
+Gradient Mean: -1274.142212
+Gradient Std: 8317.770508
+Gradient Max: 29759.123047
+Gradient Min: -100510.851562
+Gradient Norm: 1615618.875000
+
+Layer: unet2.encoder2.conv_block.conv2.bias
+Gradient Mean: -6251.018555
+Gradient Std: 16083.091797
+Gradient Max: 14301.292969
+Gradient Min: -56809.195312
+Gradient Norm: 137101.281250
+
+Layer: unet2.encoder3.conv_block.conv1.weight
+Gradient Mean: 85.612930
+Gradient Std: 3580.924072
+Gradient Max: 59084.789062
+Gradient Min: -51166.546875
+Gradient Norm: 972596.000000
+
+Layer: unet2.encoder3.conv_block.conv1.bias
+Gradient Mean: 308.406036
+Gradient Std: 4610.244141
+Gradient Max: 18771.248047
+Gradient Min: -15472.172852
+Gradient Norm: 52071.843750
+
+Layer: unet2.encoder3.conv_block.conv2.weight
+Gradient Mean: 7.394044
+Gradient Std: 2272.545654
+Gradient Max: 90075.062500
+Gradient Min: -123188.585938
+Gradient Norm: 872659.187500
+
+Layer: unet2.encoder3.conv_block.conv2.bias
+Gradient Mean: 45.536667
+Gradient Std: 3400.791992
+Gradient Max: 15883.734375
+Gradient Min: -21265.511719
+Gradient Norm: 38328.441406
+
+Layer: unet2.bottleneck.conv1.weight
+Gradient Mean: -6.722724
+Gradient Std: 827.675903
+Gradient Max: 42873.531250
+Gradient Min: -44759.582031
+Gradient Norm: 449490.062500
+
+Layer: unet2.bottleneck.conv1.bias
+Gradient Mean: -63.262882
+Gradient Std: 1728.891724
+Gradient Max: 12595.753906
+Gradient Min: -12446.379883
+Gradient Norm: 27626.736328
+
+Layer: unet2.bottleneck.conv2.weight
+Gradient Mean: 10.456815
+Gradient Std: 317.191437
+Gradient Max: 11048.520508
+Gradient Min: -9226.507812
+Gradient Norm: 243735.140625
+
+Layer: unet2.bottleneck.conv2.bias
+Gradient Mean: 189.801559
+Gradient Std: 1365.147705
+Gradient Max: 6623.818848
+Gradient Min: -5656.946289
+Gradient Norm: 22010.169922
+
+Layer: unet2.decoder3.conv_transpose.weight
+Gradient Mean: 36.732079
+Gradient Std: 655.741211
+Gradient Max: 16555.324219
+Gradient Min: -16302.237305
+Gradient Norm: 237774.937500
+
+Layer: unet2.decoder3.conv_transpose.bias
+Gradient Mean: 1482.431519
+Gradient Std: 6829.914551
+Gradient Max: 21946.429688
+Gradient Min: -14445.541016
+Gradient Norm: 78775.343750
+
+Layer: unet2.decoder3.conv_block.conv1.weight
+Gradient Mean: 8.573771
+Gradient Std: 1046.986450
+Gradient Max: 46341.273438
+Gradient Min: -56691.535156
+Gradient Norm: 568592.500000
+
+Layer: unet2.decoder3.conv_block.conv1.bias
+Gradient Mean: 199.013397
+Gradient Std: 3324.681396
+Gradient Max: 14540.452148
+Gradient Min: -18180.650391
+Gradient Norm: 37534.851562
+
+Layer: unet2.decoder3.conv_block.conv2.weight
+Gradient Mean: 152.329666
+Gradient Std: 1265.934570
+Gradient Max: 33813.765625
+Gradient Min: -16379.143555
+Gradient Norm: 489623.875000
+
+Layer: unet2.decoder3.conv_block.conv2.bias
+Gradient Mean: 1314.958008
+Gradient Std: 4109.237305
+Gradient Max: 18729.238281
+Gradient Min: -8834.770508
+Gradient Norm: 48639.769531
+
+Layer: unet2.decoder2.conv_transpose.weight
+Gradient Mean: -55.807678
+Gradient Std: 2313.513916
+Gradient Max: 22347.197266
+Gradient Min: -31175.312500
+Gradient Norm: 418906.187500
+
+Layer: unet2.decoder2.conv_transpose.bias
+Gradient Mean: -2177.043457
+Gradient Std: 46854.445312
+Gradient Max: 80274.234375
+Gradient Min: -143537.656250
+Gradient Norm: 372303.218750
+
+Layer: unet2.decoder2.conv_block.conv1.weight
+Gradient Mean: -505.489471
+Gradient Std: 13035.057617
+Gradient Max: 229545.500000
+Gradient Min: -265027.156250
+Gradient Norm: 3542032.750000
+
+Layer: unet2.decoder2.conv_block.conv1.bias
+Gradient Mean: -4651.919922
+Gradient Std: 27182.558594
+Gradient Max: 85174.125000
+Gradient Min: -98140.976562
+Gradient Norm: 218940.984375
+
+Layer: unet2.decoder2.conv_block.conv2.weight
+Gradient Mean: -4251.160645
+Gradient Std: 18706.689453
+Gradient Max: 112931.882812
+Gradient Min: -239480.484375
+Gradient Norm: 3683214.000000
+
+Layer: unet2.decoder2.conv_block.conv2.bias
+Gradient Mean: -12883.976562
+Gradient Std: 24984.894531
+Gradient Max: 40973.933594
+Gradient Min: -98819.171875
+Gradient Norm: 223497.718750
+
+Layer: unet2.decoder1.conv_transpose.weight
+Gradient Mean: -1524.552368
+Gradient Std: 14200.159180
+Gradient Max: 115654.867188
+Gradient Min: -122855.367188
+Gradient Norm: 1292559.750000
+
+Layer: unet2.decoder1.conv_transpose.bias
+Gradient Mean: -28065.255859
+Gradient Std: 113952.304688
+Gradient Max: 254574.812500
+Gradient Min: -257907.687500
+Gradient Norm: 654021.375000
+
+Layer: unet2.decoder1.conv_block.conv1.weight
+Gradient Mean: -498.865936
+Gradient Std: 11999.546875
+Gradient Max: 101848.992188
+Gradient Min: -151461.656250
+Gradient Norm: 1630475.500000
+
+Layer: unet2.decoder1.conv_block.conv1.bias
+Gradient Mean: -8187.003906
+Gradient Std: 68104.484375
+Gradient Max: 107082.250000
+Gradient Min: -273953.343750
+Gradient Norm: 382007.468750
+
+Layer: unet2.decoder1.conv_block.conv2.weight
+Gradient Mean: 674.611450
+Gradient Std: 13220.530273
+Gradient Max: 117351.578125
+Gradient Min: -103966.937500
+Gradient Norm: 1270753.375000
+
+Layer: unet2.decoder1.conv_block.conv2.bias
+Gradient Mean: 5696.260742
+Gradient Std: 76256.859375
+Gradient Max: 164502.484375
+Gradient Min: -167663.781250
+Gradient Norm: 425801.218750
+
+Layer: unet2.final_conv.weight
+Gradient Mean: 15029.843750
+Gradient Std: 14800.154297
+Gradient Max: 52921.746094
+Gradient Min: 245.332977
+Gradient Norm: 118402.117188
+
+Layer: unet2.final_conv.bias
+Gradient Mean: 90634.296875
+Gradient Std: nan
+Gradient Max: 90634.296875
+Gradient Min: 90634.296875
+Gradient Norm: 90634.296875
+
+Output Analysis:
+--------------------------------------------------
+
+Output v1:
+Shape: [32, 104]
+Mean: 152.906143
+Std: 118.630516
+Max: 497.582855
+Min: -145.681488
+
+Output v2:
+Shape: [32, 104]
+Mean: -133.200027
+Std: 95.854103
+Max: 147.856613
+Min: -390.114716
+
+Output scalars:
+Shape: [32, 5]
+Mean: 33.881699
+Std: 41.720322
+Max: 108.721367
+Min: -91.508499
+
+Analysis Complete for decoder!
