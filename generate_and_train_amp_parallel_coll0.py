@@ -3,7 +3,7 @@
 # same as used for furst paper submission
 #now adapted for VMAT
 import sys
-
+import math
 
 import numpy as np
 import time
@@ -653,18 +653,6 @@ class EncoderUNet(nn.Module):
         x = self.extencoder(vector1, vector2, scalars)
         return self.unet(x)
     
-def initialize_weights(model):
-    for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, 0, 0.01)
-            nn.init.constant_(m.bias, 0)    
 
 
 
@@ -799,20 +787,85 @@ class UNetDecoder(nn.Module):
         x = self.unet2(frames)
         return self.extdecoder(x)
     
+
+#### initalize weights #########################################################
+
+
 def initialize_weights(model):
+    """
+    Optimized weight initialization for EncoderUNet and UNetDecoder architectures
+    """
     for m in model.modules():
         if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
+            # Conv layers in UNet blocks - using He initialization for ReLU
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
+                nn.init.constant_(m.bias, 0.01)
+                
+        elif isinstance(m, nn.ConvTranspose2d):
+            # Transposed conv layers in decoder blocks
+            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            if m.bias is not None:
+                nn.init.constant_(m.bias, 0.01)
+                
+        elif isinstance(m, nn.Linear):
+            if m.in_features == 104 * 2:  # vector_fc in ExtEncoder
+                # Special initialization for processing input vectors
+                nn.init.xavier_uniform_(m.weight)
                 nn.init.constant_(m.bias, 0)
+            elif m.out_features == 512:  # fc in ExtDecoder
+                # Initialization for feature extraction
+                nn.init.xavier_uniform_(m.weight, gain=1.414)
+                nn.init.constant_(m.bias, 0)
+            else:  # Other linear layers
+                # Scale based on input size for better gradient flow
+                bound = 1 / math.sqrt(m.in_features)
+                nn.init.uniform_(m.weight, -bound, bound)
+                if m.bias is not None:
+                    nn.init.uniform_(m.bias, -bound, bound)
+                    
         elif isinstance(m, nn.BatchNorm2d):
+            # Standard initialization for batch norm
             nn.init.constant_(m.weight, 1)
             nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, 0, 0.01)
-            nn.init.constant_(m.bias, 0)    
+            
+        elif isinstance(m, nn.MaxPool2d):
+            # MaxPool doesn't have parameters but included for completeness
+            pass
 
+def initialize_encoder_specific(encoder):
+    """
+    Specific initialization for ExtEncoder
+    """
+    # Initialize vector processing layers
+    nn.init.xavier_uniform_(encoder.vector_fc.weight)
+    nn.init.constant_(encoder.vector_fc.bias, 0)
+    
+    # Initialize scalar processing layers
+    for fc in encoder.scalar_fc:
+        nn.init.xavier_uniform_(fc.weight)
+        nn.init.constant_(fc.bias, 0)
+    
+    # Initialize combined layer with careful scaling
+    nn.init.xavier_uniform_(encoder.combined_fc.weight, gain=1.414)
+    nn.init.constant_(encoder.combined_fc.bias, 0.01)
 
+def initialize_decoder_specific(decoder):
+    """
+    Specific initialization for ExtDecoder
+    """
+    # Initialize main feature extraction
+    nn.init.xavier_uniform_(decoder.fc.weight, gain=1.414)
+    nn.init.constant_(decoder.fc.bias, 0)
+    
+    # Initialize vector reconstruction layers
+    for fc in [decoder.vector_fc1, decoder.vector_fc2]:
+        nn.init.xavier_uniform_(fc.weight)
+        nn.init.constant_(fc.bias, 0)
+    
+    # Initialize scalar reconstruction
+    nn.init.xavier_uniform_(decoder.scalar_fc.weight)
+    nn.init.constant_(decoder.scalar_fc.bias, 0)
 
     
 # training_utils.py########################################################
@@ -889,16 +942,6 @@ def weighted_l1_loss(input, target, weights):
     weighted_absolute_error = absolute_error * weights
     return weighted_absolute_error.mean()
 
-def initialize_weights(model):
-    """Initialize the weights of the model using Xavier initialization"""
-    for m in model.modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
 
 def setup_training(encoderunet, unetdecoder, resume=0):
     lr = 1e-4
@@ -963,6 +1006,14 @@ def setup_training(encoderunet, unetdecoder, resume=0):
                 train_losses, val_losses, train_accuracies, 
                 val_accuracies, scaler)
     else:
+        
+
+        initialize_weights(encoderunet)
+        initialize_encoder_specific(encoderunet.module.extencoder)
+
+        initialize_weights(unetdecoder)
+        initialize_decoder_specific(unetdecoder.module.extdecoder)
+
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
                          lr=lr, weight_decay=1e-4)
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
@@ -1008,8 +1059,8 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
     
     for epoch in range(start_epoch, EPOCHS):
         # Synchronize GPUs before starting epoch
-        torch.cuda.synchronize()
-        dist.barrier()
+        #torch.cuda.synchronize()
+        #dist.barrier()
 
         # Training
         encoderunet.train()
@@ -1131,8 +1182,8 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 scaler.update()
                 
                 # Synchronize after optimization
-                torch.cuda.synchronize()
-                dist.barrier()
+                #torch.cuda.synchronize()
+                #dist.barrier()
                 
                 loader_loss_sum += loss.item()
                 loader_accuracy_sum += accuracy
@@ -1141,6 +1192,13 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
             num_batches = len(train_loader)
             running_train_losses[i] = loader_loss_sum / num_batches
             running_train_accuracies[i] = loader_accuracy_sum / num_batches
+
+            # Print progress
+            #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(train_loaders)}] "
+            #      f"Batch [{batch_idx+1}/{len(train_loader)}]  "
+            #      f"Temp. Train. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
+            #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
+            #      f"{loss.item():.2e}  Temp. Train. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
 
 
         # Validation
@@ -1261,6 +1319,12 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 num_batches = len(val_loader)
                 running_val_losses[i] = loader_loss_sum / num_batches
                 running_val_accuracies[i] = loader_accuracy_sum / num_batches
+
+                #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(val_loaders)}] "
+                #      f"Batch [{batch_idx+1}/{len(val_loader)}]  "
+                #      f"Temp. Val. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
+                #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
+                #      f"{loss.item():.2e}  Temp. Val. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
 
 
              # Calculate average metrics for the epoch
@@ -1411,7 +1475,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         val_ds = Subset(Art_dataset, val_indices)
 
         # Adjust batch size based on available GPU memory
-        batch_size = 256 // world_size  # Scale batch size by number of GPUs
+        batch_size = 256// world_size  # Scale batch size by number of GPUs
     
 
         train_loader = DataLoader(
@@ -1466,7 +1530,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=1)
     
     if rank == 0:
         print("Training completed!")
