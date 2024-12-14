@@ -510,39 +510,25 @@ def generate_and_save_dataset(dataset_num, KM):
 class ExtEncoder(nn.Module):
     def __init__(self, vector_dim, scalar_count, latent_image_size):
         super(ExtEncoder, self).__init__()
+        # Store latent_image_size as instance variable
         self.latent_image_size = latent_image_size
         
         # Processing the vector inputs
-        self.vector_fc = nn.Sequential(
-            nn.Linear(vector_dim * 2, 512),
-            nn.ReLU(),
-            nn.Linear(512, 256),  # Intermediate layer
-            nn.ReLU()
-        )
+        self.vector_fc = nn.Linear(vector_dim * 2, 512)
         
         # Processing the scalar inputs
-        self.scalar_fc = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(1, 64),
-                nn.ReLU(),
-                nn.Linear(64, 32)  # Intermediate layer
-            ) for _ in range(scalar_count)
-        ])
+        self.scalar_fc = nn.ModuleList([nn.Linear(1, 64) for _ in range(scalar_count)])
         
-        # Combined fully connected layer
-        self.combined_fc = nn.Sequential(
-            nn.Linear(256 + scalar_count * 32, 512),
-            nn.ReLU(),
-            nn.Linear(512, latent_image_size ** 2 * 1)  # Final layer
-        )
+        # Combined fully connected layer 
+        self.combined_fc = nn.Linear(512 + scalar_count * 64, latent_image_size ** 2 * 1)
         
     def forward(self, vector1, vector2, scalars):
         # Process the vectors
         vectors_combined = torch.cat((vector1.flatten(1), vector2.flatten(1)), dim=1)
-        vectors_encoded = self.vector_fc(vectors_combined)
+        vectors_encoded = F.relu(self.vector_fc(vectors_combined))
 
         # Process each scalar individually
-        scalars_encoded = [fc(scalar) for fc, scalar in zip(self.scalar_fc, scalars.unbind(dim=2))]
+        scalars_encoded = [F.relu(fc(scalar)) for fc, scalar in zip(self.scalar_fc, scalars.unbind(dim=2))]
         scalars_encoded = torch.cat(scalars_encoded, dim=1)
 
         # Combine the processed vectors and scalars
@@ -554,6 +540,7 @@ class ExtEncoder(nn.Module):
         # Apply ReLU activation
         latent_image = torch.relu(combined_output)
         
+        # Use self.latent_image_size instead of latent_image_size
         return latent_image.view(-1, 1, self.latent_image_size, self.latent_image_size)
 
     
@@ -562,9 +549,11 @@ class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ConvBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.relu1 = nn.ReLU(inplace=False)
+        self.self.conv1_bn = nn.BatchNorm2d(self.conv1.out_channels)
+        self.relu1 = self.self.relu1_bn(self.relu1)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.relu2 = nn.ReLU(inplace=False)
+        self.self.conv2_bn = nn.BatchNorm2d(self.conv2.out_channels)
+        self.relu2 = self.self.relu2_bn(self.relu2)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -618,7 +607,8 @@ class UNet(nn.Module):
         self.resize_out = nn.Upsample(size=(resize_out, resize_out), mode='bilinear', align_corners=False)
         
         self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.final_ReLU = nn.ReLU(inplace=False)
+        self.self.final_conv_bn = nn.BatchNorm2d(self.final_conv.out_channels)
+        self.final_ReLU = self.self.final_ReLU_bn(self.final_ReLU)
 
         # New: Option to freeze encoder layers
         if freeze_encoder:
@@ -643,7 +633,7 @@ class UNet(nn.Module):
     
         
         output = self.final_conv(u1)
-        output = self.final_ReLU(output)
+        output = self.output_bn(output)
         output = self.resize_out(output)
     
         return output
@@ -677,52 +667,28 @@ class EncoderUNet(nn.Module):
 class ExtDecoder(nn.Module):
     def __init__(self, vector_dim, scalar_count, latent_image_size):
         super(ExtDecoder, self).__init__()
-        self.fc = nn.Sequential(
-            nn.Linear(latent_image_size ** 2 * 1, 1024),  # Intermediate layers
-            nn.ReLU(),
-            nn.Linear(1024, 512)
-        )
-        
-        # Adding intermediate layers for the vector decoders
-        self.vector_fc1 = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, vector_dim)
-        )
-        self.vector_fc2 = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, vector_dim)
-        )
-        
-        # Adding intermediate layers for the scalar decoder
-        self.scalar_fc = nn.Sequential(
-            nn.Linear(512, 256),
-            nn.ReLU(),
-            nn.Linear(256, scalar_count)
-        )
+        self.fc = nn.Linear(latent_image_size ** 2 * 1 , 512) # 1 channels
+        self.vector_fc1 = nn.Linear(512, vector_dim)
+        self.vector_fc2 = nn.Linear(512, vector_dim)
+        self.scalar_fc = nn.Linear(512, scalar_count)
 
     def forward(self, latent_image):
-        # Flatten the latent image
         x = latent_image.view(latent_image.size(0), -1)
-        
-        # Process through intermediate layers
-        x = self.fc(x)
-        
-        # Decode vectors and scalars
+        x = F.relu(self.fc(x))
         reconstructed_vector1 = self.vector_fc1(x)
         reconstructed_vector2 = self.vector_fc2(x)
         reconstructed_scalars = self.scalar_fc(x)
-        
         return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dropout_prob=0.0):
         super(ConvBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.relu1 = nn.ReLU(inplace=False)
+        self.self.conv1_bn = nn.BatchNorm2d(self.conv1.out_channels)
+        self.relu1 = self.self.relu1_bn(self.relu1)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.relu2 = nn.ReLU(inplace=False)
+        self.self.conv2_bn = nn.BatchNorm2d(self.conv2.out_channels)
+        self.relu2 = self.self.relu2_bn(self.relu2)
 
     def forward(self, x):
         x = self.conv1(x)
@@ -776,7 +742,8 @@ class UNet2(nn.Module):
         #self.resize_out = nn.Upsample(size=(resize_out, resize_out), mode='bilinear', align_corners=False)
         
         self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.final_ReLU = nn.ReLU(inplace=False)
+        self.self.final_conv_bn = nn.BatchNorm2d(self.final_conv.out_channels)
+        self.final_ReLU = self.self.final_ReLU_bn(self.final_ReLU)
 
         # New: Option to freeze encoder layers
         if freeze_encoder:
@@ -800,7 +767,7 @@ class UNet2(nn.Module):
         u1 = self.decoder1(u2, f1)
 
         output = self.final_conv(u1)
-        output = self.final_ReLU(output)
+        output = self.output_bn(output)
         
     
         return output
@@ -872,54 +839,39 @@ def initialize_weights(model):
             # MaxPool doesn't have parameters but included for completeness
             pass
 
-
 def initialize_encoder_specific(encoder):
     """
-    Specific initialization for the improved ExtEncoder.
+    Specific initialization for ExtEncoder
     """
     # Initialize vector processing layers
-    for layer in encoder.vector_fc:
-        if isinstance(layer, nn.Linear):
-            nn.init.xavier_uniform_(layer.weight)
-            nn.init.constant_(layer.bias, 0)
+    nn.init.xavier_uniform_(encoder.vector_fc.weight)
+    nn.init.constant_(encoder.vector_fc.bias, 0)
     
     # Initialize scalar processing layers
-    for scalar_block in encoder.scalar_fc:
-        for layer in scalar_block:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0)
+    for fc in encoder.scalar_fc:
+        nn.init.xavier_uniform_(fc.weight)
+        nn.init.constant_(fc.bias, 0)
     
-    # Initialize combined layer
-    for layer in encoder.combined_fc:
-        if isinstance(layer, nn.Linear):
-            nn.init.xavier_uniform_(layer.weight, gain=1.414)  # Slightly higher gain for combined layers
-            nn.init.constant_(layer.bias, 0.01)
+    # Initialize combined layer with careful scaling
+    nn.init.xavier_uniform_(encoder.combined_fc.weight, gain=1.414)
+    nn.init.constant_(encoder.combined_fc.bias, 0.01)
 
-
-    
 def initialize_decoder_specific(decoder):
     """
-    Specific initialization for the improved ExtDecoder.
+    Specific initialization for ExtDecoder
     """
-    # Initialize main feature extraction layers
-    for layer in decoder.fc:
-        if isinstance(layer, nn.Linear):
-            nn.init.xavier_uniform_(layer.weight, gain=1.414)
-            nn.init.constant_(layer.bias, 0)
+    # Initialize main feature extraction
+    nn.init.xavier_uniform_(decoder.fc.weight, gain=1.414)
+    nn.init.constant_(decoder.fc.bias, 0)
     
     # Initialize vector reconstruction layers
-    for vector_block in [decoder.vector_fc1, decoder.vector_fc2]:
-        for layer in vector_block:
-            if isinstance(layer, nn.Linear):
-                nn.init.xavier_uniform_(layer.weight)
-                nn.init.constant_(layer.bias, 0)
+    for fc in [decoder.vector_fc1, decoder.vector_fc2]:
+        nn.init.xavier_uniform_(fc.weight)
+        nn.init.constant_(fc.bias, 0)
     
-    # Initialize scalar reconstruction layers
-    for layer in decoder.scalar_fc:
-        if isinstance(layer, nn.Linear):
-            nn.init.xavier_uniform_(layer.weight)
-            nn.init.constant_(layer.bias, 0)
+    # Initialize scalar reconstruction
+    nn.init.xavier_uniform_(decoder.scalar_fc.weight)
+    nn.init.constant_(decoder.scalar_fc.bias, 0)
 
     
 # training_utils.py########################################################
@@ -1004,7 +956,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
     
     if resume == 1:
         # Load checkpoint
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ImpExtcheckpoint.pth', 
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth', 
                               map_location='cpu')
         
         # Handle state dict for DDP models
@@ -1458,7 +1410,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ImpExt_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1584,7 +1536,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=1)
     
     if rank == 0:
         print("Training completed!")
