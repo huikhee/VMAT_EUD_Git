@@ -549,16 +549,18 @@ class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ConvBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.self.conv1_bn = nn.BatchNorm2d(self.conv1.out_channels)
-        self.relu1 = self.self.relu1_bn(self.relu1)
+        self.conv1_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.relu1 = nn.ReLU(inplace=False)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.self.conv2_bn = nn.BatchNorm2d(self.conv2.out_channels)
-        self.relu2 = self.self.relu2_bn(self.relu2)
+        self.conv2_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.relu2 = nn.ReLU(inplace=False)
 
     def forward(self, x):
         x = self.conv1(x)
+        x = self.conv1_bn(x)
         x = self.relu1(x)
         x = self.conv2(x)
+        x = self.conv2_bn(x)
         x = self.relu2(x)
         return x
 
@@ -607,8 +609,8 @@ class UNet(nn.Module):
         self.resize_out = nn.Upsample(size=(resize_out, resize_out), mode='bilinear', align_corners=False)
         
         self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.self.final_conv_bn = nn.BatchNorm2d(self.final_conv.out_channels)
-        self.final_ReLU = self.self.final_ReLU_bn(self.final_ReLU)
+        self.final_conv_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.final_ReLU = nn.ReLU(inplace=False)
 
         # New: Option to freeze encoder layers
         if freeze_encoder:
@@ -633,7 +635,8 @@ class UNet(nn.Module):
     
         
         output = self.final_conv(u1)
-        output = self.output_bn(output)
+        output = self.final_conv_bn(output)
+        output = self.final_ReLU(output)
         output = self.resize_out(output)
     
         return output
@@ -684,16 +687,18 @@ class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels, dropout_prob=0.0):
         super(ConvBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.self.conv1_bn = nn.BatchNorm2d(self.conv1.out_channels)
-        self.relu1 = self.self.relu1_bn(self.relu1)
+        self.conv1_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.relu1 = nn.ReLU(inplace=False)
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.self.conv2_bn = nn.BatchNorm2d(self.conv2.out_channels)
-        self.relu2 = self.self.relu2_bn(self.relu2)
+        self.conv2_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.relu2 = nn.ReLU(inplace=False)
 
     def forward(self, x):
         x = self.conv1(x)
+        x = self.conv1_bn(x)
         x = self.relu1(x)
         x = self.conv2(x)
+        x = self.conv2_bn(x)
         x = self.relu2(x)
         return x
 
@@ -742,8 +747,8 @@ class UNet2(nn.Module):
         #self.resize_out = nn.Upsample(size=(resize_out, resize_out), mode='bilinear', align_corners=False)
         
         self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.self.final_conv_bn = nn.BatchNorm2d(self.final_conv.out_channels)
-        self.final_ReLU = self.self.final_ReLU_bn(self.final_ReLU)
+        self.final_conv_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.final_ReLU = nn.ReLU(inplace=False)
 
         # New: Option to freeze encoder layers
         if freeze_encoder:
@@ -767,7 +772,8 @@ class UNet2(nn.Module):
         u1 = self.decoder1(u2, f1)
 
         output = self.final_conv(u1)
-        output = self.output_bn(output)
+        output = self.final_conv_bn(output)
+        output = self.final_ReLU(output)
         
     
         return output
@@ -956,7 +962,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
     
     if resume == 1:
         # Load checkpoint
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth', 
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_batchnorm_checkpoint.pth', 
                               map_location='cpu')
         
         # Handle state dict for DDP models
@@ -1037,12 +1043,11 @@ def setup_training(encoderunet, unetdecoder, resume=0):
 # training_loop.py
 
 def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0):
-    # Get training setup (now returns scaler instead of scaler_state)
+    # Get training setup
     optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies, scaler = setup_training(encoderunet, unetdecoder, resume)
-
-    # Remove this line since scaler is now directly returned from setup_training
-    # if scaler_state is not None:
-    #     scaler.load_state_dict(scaler_state)
+    
+    # Add anomaly detection during training
+    torch.autograd.set_detect_anomaly(True)
 
     # Get rank for printing
     rank = dist.get_rank()
@@ -1131,11 +1136,11 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     # Penalty losses
                     penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
                                              v1_reconstructed - v2_reconstructed,
-                                             torch.zeros_like(v2_reconstructed)).sum()
+                                             torch.zeros_like(v2_reconstructed)).sum().clone()
                     
                     penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
                                                v1_reconstructed_2 - v2_reconstructed_2,
-                                               torch.zeros_like(v2_reconstructed_2)).sum()
+                                               torch.zeros_like(v2_reconstructed_2)).sum().clone()
                     
                     # Consistency losses
                     if v1_reconstructed.size(0) > 1:
@@ -1268,11 +1273,11 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     # Penalty losses
                     penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
                                              v1_reconstructed - v2_reconstructed,
-                                             torch.zeros_like(v2_reconstructed)).sum()
+                                             torch.zeros_like(v2_reconstructed)).sum().clone()
                     
                     penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
                                                v1_reconstructed_2 - v2_reconstructed_2,
-                                               torch.zeros_like(v2_reconstructed_2)).sum()
+                                               torch.zeros_like(v2_reconstructed_2)).sum().clone()
                     
                     # Consistency losses
                     if v1_reconstructed.size(0) > 1:
@@ -1410,7 +1415,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_batchnorm_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1536,7 +1541,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=1)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
     
     if rank == 0:
         print("Training completed!")

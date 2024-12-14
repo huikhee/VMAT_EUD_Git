@@ -4,7 +4,7 @@ import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from torchvision.utils import make_grid
-from generate_and_train_amp_parallel_coll0_TB import (
+from generate_and_train_amp_parallel_coll0 import (
     EncoderUNet, UNetDecoder, ExtEncoder, ExtDecoder, 
     CustomDataset, load_dataset
 )
