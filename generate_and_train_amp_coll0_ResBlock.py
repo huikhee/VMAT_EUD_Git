@@ -670,7 +670,6 @@ class ExtDecoder(nn.Module):
         return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
 
 
-
 class UNet2(nn.Module):
     def __init__(self, in_channels, out_channels, resize_in, freeze_encoder=False):
         super(UNet2, self).__init__()
@@ -1222,6 +1221,10 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
         val_losses.append(average_val_loss)
         val_accuracies.append(average_val_accuracy)
 
+        # Calculate elapsed time and get current learning rate
+        elapsed_time = time.time() - start_time
+        current_lr = optimizer.param_groups[0]['lr']
+
         # Print epoch summary
         print(f"Epoch [{epoch+1}/{EPOCHS}] "
               f"Avg. Train Loss: {average_train_loss:.4e} "
@@ -1232,6 +1235,9 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
               f"Current LR: {current_lr:.4e}")
         
         sys.stdout.flush()
+
+        # Step the scheduler
+        scheduler.step()
 
         # Save checkpoint
         checkpoint = {
