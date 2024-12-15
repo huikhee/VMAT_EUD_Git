@@ -504,7 +504,6 @@ def generate_and_save_dataset(dataset_num, KM):
 
 # models.py
 
-
 # encoderunet architecture
 # The encoder combines the input vectors and scalar values, then expands and reshapes this combined input into a channelsx64x64 image
 # This serves as input to the u-net
@@ -545,41 +544,44 @@ class ExtEncoder(nn.Module):
         # Use self.latent_image_size instead of latent_image_size
         return latent_image.view(-1, 1, self.latent_image_size, self.latent_image_size)
 
-    
 
-# Common BatchNorm configuration
-def get_batchnorm2d(num_features):
+def get_batchnorm2d(num_features, eps=1e-5, momentum=0.1, affine=True, track_running_stats=True):
     return nn.BatchNorm2d(
         num_features,
-        eps=1e-5,  # Standard epsilon
-        momentum=0.1,  # Standard momentum
-        track_running_stats=True,
-        affine=True
+        eps=eps,
+        momentum=momentum,
+        affine=affine,
+        track_running_stats=track_running_stats
     )
 
-class ConvBlock(nn.Module):
+class ResidualConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
-        super(ConvBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv1_bn = get_batchnorm2d(out_channels)
-        self.relu1 = nn.ReLU(inplace=False)  # Consistent inplace=False for stability
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2_bn = get_batchnorm2d(out_channels)
-        self.relu2 = nn.ReLU(inplace=False)
+        super(ResidualConvBlock, self).__init__()
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = get_batchnorm2d(out_channels)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = get_batchnorm2d(out_channels)
+
+        self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=False) if in_channels != out_channels else nn.Identity()
 
     def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv1_bn(x)
-        x = self.relu1(x)
-        x = self.conv2(x)
-        x = self.conv2_bn(x)
-        x = self.relu2(x)
-        return x
+        identity = self.shortcut(x)
+        out = self.conv1(x)
+        out = self.bn1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.bn2(out)
+        
+        out += identity
+        out = self.relu(out)
+        return out
 
 class EncoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(EncoderBlock, self).__init__()
-        self.conv_block = ConvBlock(in_channels, out_channels)
+        self.conv_block = ResidualConvBlock(in_channels, out_channels)
         self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
 
     def forward(self, x):
@@ -590,79 +592,54 @@ class EncoderBlock(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(DecoderBlock, self).__init__()
-        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv_block = ConvBlock(out_channels+out_channels, out_channels)
+        self.up = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        self.conv_block = ResidualConvBlock(out_channels*2, out_channels)
 
-    def forward(self, x, conv_features):
-        x = self.conv_transpose(x)
-        x = torch.cat((x, conv_features), dim=1)
+    def forward(self, x, skip_features):
+        x = self.up(x)
+        x = torch.cat([x, skip_features], dim=1)
         x = self.conv_block(x)
         return x
-    
-
-    
 
 class UNet(nn.Module):
-    def __init__(self, in_channels, out_channels, resize_out, freeze_encoder):
+    def __init__(self, in_channels, out_channels, resize_out, freeze_encoder=False):
         super(UNet, self).__init__()
-        
-        # Replace resize_out with a more controlled upsampling approach
-        self.final_size = resize_out
-        
+        self.resize_out = resize_out
+
+        # Encoder
         self.encoder1 = EncoderBlock(in_channels, 32)
         self.encoder2 = EncoderBlock(32, 64)
         self.encoder3 = EncoderBlock(64, 128)
-        
-        self.bottleneck = ConvBlock(128, 256)
-        
+
+        # Bottleneck
+        self.bottleneck = ResidualConvBlock(128, 256)
+
+        # Decoder
         self.decoder3 = DecoderBlock(256, 128)
         self.decoder2 = DecoderBlock(128, 64)
         self.decoder1 = DecoderBlock(64, 32)
 
-        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.final_conv_bn = get_batchnorm2d(out_channels)
-        self.final_ReLU = nn.ReLU(inplace=True)
-        
-        # Add progressive upsampling layers
-        self.upsample1 = nn.Upsample(scale_factor=1.5, mode='bilinear', align_corners=True)
-        self.conv_up1 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn_up1 = get_batchnorm2d(out_channels)
-        
-        self.upsample2 = nn.Upsample(size=(self.final_size, self.final_size), 
-                                    mode='bilinear', align_corners=True)
-        self.conv_up2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.bn_up2 = get_batchnorm2d(out_channels)
+        # Final output
+        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1)
+
 
     def forward(self, x):
+        # Encoder
         f1, p1 = self.encoder1(x)
         f2, p2 = self.encoder2(p1)
         f3, p3 = self.encoder3(p2)
-    
-        bottleneck = self.bottleneck(p3)
-    
-        u3 = self.decoder3(bottleneck, f3)
-        u2 = self.decoder2(u3, f2)
-        u1 = self.decoder1(u2, f1)
-    
-        output = self.final_conv(u1)
-        output = self.final_conv_bn(output)
-        output = self.final_ReLU(output)
-        
-        # Progressive upsampling with additional convolutions
-        output = self.upsample1(output)
-        output = self.conv_up1(output)
-        output = self.bn_up1(output)
-        output = F.relu(output)
-        
-        output = self.upsample2(output)
-        output = self.conv_up2(output)
-        output = self.bn_up2(output)
-        output = F.relu(output)
-        
-        # Add residual connection
-        output = output + F.interpolate(x, size=(self.final_size, self.final_size), 
-                                      mode='bilinear', align_corners=True)
-        
+
+        # Bottleneck
+        b = self.bottleneck(p3)
+
+        # Decoder
+        d3 = self.decoder3(b, f3)
+        d2 = self.decoder2(d3, f2)
+        d1 = self.decoder1(d2, f1)
+
+        output = self.final_conv(d1)
+        # Upscale to resize_out x resize_out
+        output = F.interpolate(output, size=(self.resize_out, self.resize_out), mode='bilinear', align_corners=True)
         return output
 
 class EncoderUNet(nn.Module):
@@ -671,17 +648,16 @@ class EncoderUNet(nn.Module):
 
         self.extencoder = extencoder(vector_dim, scalar_count, latent_image_size)
 
-        if freeze_encoder:  # freeze also the external encoder
+        if freeze_encoder:
             for param in self.extencoder.parameters():
                 param.requires_grad = False
-
-        # The encoder outputs a single-channel latent_imgae_size x latent_imgae_size image
 
         self.unet = UNet(in_channels, out_channels, resize_out, freeze_encoder)
 
     def forward(self, vector1, vector2, scalars):
         x = self.extencoder(vector1, vector2, scalars)
         return self.unet(x)
+
     
 
 
@@ -691,10 +667,11 @@ class EncoderUNet(nn.Module):
 # The decoder attempts to reconstruct the original scalar vectors and scalar values from the latent image.
 # This serves as output to the u-net
 
+
 class ExtDecoder(nn.Module):
     def __init__(self, vector_dim, scalar_count, latent_image_size):
         super(ExtDecoder, self).__init__()
-        self.fc = nn.Linear(latent_image_size ** 2 * 1 , 512) # 1 channels
+        self.fc = nn.Linear(latent_image_size ** 2 * 1, 512)  # 1 channel
         self.vector_fc1 = nn.Linear(512, vector_dim)
         self.vector_fc2 = nn.Linear(512, vector_dim)
         self.scalar_fc = nn.Linear(512, scalar_count)
@@ -702,75 +679,70 @@ class ExtDecoder(nn.Module):
     def forward(self, latent_image):
         x = latent_image.view(latent_image.size(0), -1)
         x = F.relu(self.fc(x))  # Add ReLU activation
-        
+
         # Add dropout for regularization
         x = F.dropout(x, p=0.1, training=self.training)
-        
+
         # Reconstruct vectors with tanh to bound the output
         reconstructed_vector1 = torch.tanh(self.vector_fc1(x)) * 130  # Scale to [-130, 130]
         reconstructed_vector2 = torch.tanh(self.vector_fc2(x)) * 130
-        
+
         # Ensure vector2 > vector1
         reconstructed_vector2 = reconstructed_vector1 + F.softplus(reconstructed_vector2 - reconstructed_vector1)
-        
+
         # Reconstruct scalars with clamping
         reconstructed_scalars = self.scalar_fc(x)
         reconstructed_scalars = torch.clamp(reconstructed_scalars, min=-130, max=130)
-        
+
         return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
 
 
 class UNet2(nn.Module):
-    def __init__(self, in_channels, out_channels, resize_in, freeze_encoder):
+    def __init__(self, in_channels, out_channels, resize_in, freeze_encoder=False):
         super(UNet2, self).__init__()
         
-        # Progressive upsampling for input resizing
-        self.upsample1 = nn.Upsample(scale_factor=1.5, mode='bilinear', align_corners=True)
-        self.conv_up1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
-        self.bn_up1 = get_batchnorm2d(in_channels)
-        
-        self.upsample2 = nn.Upsample(size=(resize_in, resize_in), mode='bilinear', align_corners=True)
-        self.conv_up2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
-        self.bn_up2 = get_batchnorm2d(in_channels)
-        
-        self.encoder1 = EncoderBlock(in_channels, 32)  # Use existing EncoderBlock
+        # Encoder
+        self.encoder1 = EncoderBlock(in_channels, 32)
         self.encoder2 = EncoderBlock(32, 64)
         self.encoder3 = EncoderBlock(64, 128)
-        
-        self.bottleneck = ConvBlock(128, 256)
-        
-        self.decoder3 = DecoderBlock(256, 128)  # Use existing DecoderBlock
+
+        # Bottleneck
+        self.bottleneck = ResidualConvBlock(128, 256)
+
+        # Decoder
+        self.decoder3 = DecoderBlock(256, 128)
         self.decoder2 = DecoderBlock(128, 64)
         self.decoder1 = DecoderBlock(64, 32)
-        
-        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.final_conv_bn = get_batchnorm2d(out_channels)  # Use common BatchNorm config
+
+        # Final output
+        self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1)
+        self.final_conv_bn = get_batchnorm2d(out_channels)
         self.final_ReLU = nn.ReLU(inplace=False)
-        
-        # Option to freeze encoder layers
+
+        # If freeze_encoder is True, freeze the decoder and bottleneck layers
+        # (Keeping the logic as originally provided)
         if freeze_encoder:
-            for encoder in [self.decoder1, self.decoder2, self.decoder3, self.bottleneck]:
-                for param in encoder.parameters():
+            for module in [self.decoder1, self.decoder2, self.decoder3, self.bottleneck]:
+                for param in module.parameters():
                     param.requires_grad = False
-        
+
+        # resize_in is assumed to be the target size, e.g., 128
+        self.resize_in = resize_in
+
     def forward(self, x):
-        # Progressive upsampling of input
-        x = self.upsample1(x)
-        x = self.conv_up1(x)
-        x = self.bn_up1(x)
-        x = F.relu(x)
-        
-        x = self.upsample2(x)
-        x = self.conv_up2(x)
-        x = self.bn_up2(x)
-        xr = F.relu(x)
-    
-        f1, p1 = self.encoder1(xr)
+        # Simplify resizing: directly interpolate the input from 131x131 to 128x128
+        # If the input is already 131x131:
+        x = F.interpolate(x, size=(self.resize_in, self.resize_in), mode='bilinear', align_corners=True)
+
+        # Encoder
+        f1, p1 = self.encoder1(x)
         f2, p2 = self.encoder2(p1)
         f3, p3 = self.encoder3(p2)
-    
+
+        # Bottleneck
         bottleneck = self.bottleneck(p3)
-    
+
+        # Decoder
         u3 = self.decoder3(bottleneck, f3)
         u2 = self.decoder2(u3, f2)
         u1 = self.decoder1(u2, f1)
@@ -778,29 +750,29 @@ class UNet2(nn.Module):
         output = self.final_conv(u1)
         output = self.final_conv_bn(output)
         output = self.final_ReLU(output)
-    
+
+        # Now output is already at 128x128 (resize_in)
         return output
 
-class UNetDecoder(nn.Module):
-    def __init__(self, extdecoder, vector_dim, scalar_count, latent_image_size, in_channels, out_channels, resize_in,freeze_encoder=False):
-        super(UNetDecoder, self).__init__()
 
+class UNetDecoder(nn.Module):
+    def __init__(self, extdecoder, vector_dim, scalar_count, latent_image_size, in_channels, out_channels, resize_in, freeze_encoder=False):
+        super(UNetDecoder, self).__init__()
 
         self.extdecoder = extdecoder(vector_dim, scalar_count, latent_image_size)
 
-        
-
         # The decoder outputs 2 vectors and scalars
+        self.unet2 = UNet2(in_channels, out_channels, resize_in, freeze_encoder)
 
-        self.unet2 = UNet2(in_channels, out_channels, resize_in,freeze_encoder)
-
-        if freeze_encoder:  # freeze also the external decoder
+        if freeze_encoder:
+            # freeze also the external decoder parameters
             for param in self.extdecoder.parameters():
                 param.requires_grad = False
 
     def forward(self, frames):
         x = self.unet2(frames)
         return self.extdecoder(x)
+
     
 
 #### initalize weights #########################################################
@@ -833,19 +805,6 @@ def initialize_weights(model):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
                 
-        elif isinstance(m, nn.Linear):
-            if m.in_features == 104 * 2:  # vector_fc in ExtEncoder
-                # Use smaller initialization for stability
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                nn.init.zeros_(m.bias)
-            elif m.out_features == 512:  # fc in ExtDecoder
-                nn.init.xavier_uniform_(m.weight, gain=0.5)
-                nn.init.zeros_(m.bias)
-            else:  # Other linear layers
-                bound = 1 / math.sqrt(m.in_features)
-                nn.init.uniform_(m.weight, -bound/2, bound/2)  # Reduced range
-                if m.bias is not None:
-                    nn.init.zeros_(m.bias)
 
 def initialize_encoder_specific(encoder):
     """
@@ -959,7 +918,7 @@ def weighted_l1_loss(input, target, weights):
 
 def setup_training(encoderunet, unetdecoder, resume=0):
     # Reduce initial learning rate
-    lr = 1e-3  
+    lr = 1e-4  
     
     # Use a more stable optimizer configuration
     optimizer = AdamW(
@@ -1019,7 +978,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
             optimizer,
             T_0=20,  # Consistent with non-resume case
             T_mult=2,
-            eta_min=1e-6
+            eta_min=1e-4
         )
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
@@ -1036,7 +995,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         # Add warmup scheduler
         warmup_scheduler = LinearLR(
             optimizer,
-            start_factor=0.1,
+            start_factor=1.0,
             end_factor=1.0,
             total_iters=5  # Warmup for 5 epochs
         )
@@ -1045,7 +1004,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
             optimizer,
             T_0=20,
             T_mult=2,
-            eta_min=1e-5
+            eta_min=1e-4
         )
         
         scheduler = SequentialLR(
@@ -1096,11 +1055,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
     # Add max gradient norm
     max_grad_norm = 1.0
     
-    # Add loss scaling factors
-    forward_loss_scale = 1.0
-    backward_loss_scale = 0.1
-    consistency_loss_scale = 0.01
-    penalty_loss_scale = 0.1
+
     
     for epoch in range(start_epoch, EPOCHS):
         try:
@@ -1123,18 +1078,6 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 loader_accuracy_sum = 0.0
                 
                 for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(train_loader):
-                    # Ensure all processes have same batch size
-                    batch_size = v1.size(0)
-                    min_batch_size = torch.tensor([batch_size], device=device)
-                    dist.all_reduce(min_batch_size, op=dist.ReduceOp.MIN)
-                    if batch_size > min_batch_size.item():
-                        v1 = v1[:min_batch_size]
-                        v2 = v2[:min_batch_size]
-                        scalars = scalars[:min_batch_size]
-                        v1_weight = v1_weight[:min_batch_size]
-                        v2_weight = v2_weight[:min_batch_size]
-                        arrays = arrays[:min_batch_size]
-                        arrays_p = arrays_p[:min_batch_size]
                     
                     # Move data to device
                     v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
@@ -1154,7 +1097,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                         l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
                         l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
                         weight = 1/scalars[:,0,0]
-                        loss_for = forward_loss_scale * (l1_loss_per_sample * weight).mean()
+                        loss_for = (l1_loss_per_sample * weight).mean()
                         
                         # First decoder pass
                         arrays_con = torch.cat([arrays_p, arrays], dim=1)
@@ -1169,7 +1112,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                         l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
                         l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
                         weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
-                        loss_for_2 = forward_loss_scale * (l1_loss_per_sample * weight).mean()
+                        loss_for_2 = (l1_loss_per_sample * weight).mean()
                         
                         # Second decoder pass
                         arrays_p = outputs[:-1]
@@ -1214,7 +1157,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                                 v2_weight[1:-1, -52:]
                             )
                             
-                            consistency_loss = consistency_loss_scale * (mse_loss_v1_diff + mse_loss_v2_diff +
+                            consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff +
                                                                           mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
                         
                         # Reconstruction losses
@@ -1222,15 +1165,15 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                         mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
                         mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
                         
-                        loss_back = backward_loss_scale * (mse_loss_v1 + mse_loss_v2 + 
-                                                            mse_loss_scalars + penalty_loss_scale * penalty_loss)
+                        loss_back = (mse_loss_v1 + mse_loss_v2 + 
+                                                            mse_loss_scalars + penalty_loss)
                         
                         mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
                         mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
                         mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
                         
-                        loss_back_2 = backward_loss_scale * (mse_loss_v1_2 + mse_loss_v2_2 + 
-                                                              mse_loss_scalars_2 + penalty_loss_scale * penalty_loss_2)
+                        loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + 
+                                                              mse_loss_scalars_2 * penalty_loss_2)
                         
                         # Total loss
                         loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
@@ -1351,7 +1294,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                                 v2_weight[1:-1, -52:]
                             )
                             
-                            consistency_loss = consistency_loss_scale * (mse_loss_v1_diff + mse_loss_v2_diff +
+                            consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff +
                                                                           mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
                         
                         # Reconstruction losses
@@ -1359,15 +1302,15 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                         mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
                         mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
                         
-                        loss_back = backward_loss_scale * (mse_loss_v1 + mse_loss_v2 + 
-                                                            mse_loss_scalars + penalty_loss_scale * penalty_loss)
+                        loss_back = (mse_loss_v1 + mse_loss_v2 + 
+                                                            mse_loss_scalars + penalty_loss)
                         
                         mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
                         mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
                         mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
                         
-                        loss_back_2 = backward_loss_scale * (mse_loss_v1_2 + mse_loss_v2_2 + 
-                                                              mse_loss_scalars_2 + penalty_loss_scale * penalty_loss_2)
+                        loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + 
+                                                              mse_loss_scalars_2 + penalty_loss_2)
                         
                         # Total loss
                         loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
@@ -1393,11 +1336,6 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
             average_val_loss = sum(running_val_losses) / len(val_loaders)
             average_val_accuracy = sum(running_val_accuracies) / len(val_loaders)
 
-            # Append to history
-            #train_losses.append(average_train_loss)
-            #train_accuracies.append(average_train_accuracy)
-            #val_losses.append(average_val_loss)
-            #val_accuracies.append(average_val_accuracy)
             
             # Step scheduler - remove epoch argument
             scheduler.step()  # Changed from scheduler.step(epoch)
@@ -1527,7 +1465,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
     end_dataset = start_dataset + datasets_per_gpu
 
     # Generate or load datasets assigned to this GPU
-    for dataset_num in range(start_dataset, end_dataset):
+    for dataset_num in range(start_dataset, end_dataset,80):
         start_time = time.time()
 
         if generate_flag == 0:
