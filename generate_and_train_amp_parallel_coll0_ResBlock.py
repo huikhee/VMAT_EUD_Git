@@ -899,7 +899,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
     
     if resume == 1:
         # Load checkpoint
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth', 
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_checkpoint.pth', 
                               map_location='cpu')
         
         # Handle state dict for DDP models
@@ -1353,7 +1353,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1485,7 +1485,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=1)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
     
     if rank == 0:
         print("Training completed!")
