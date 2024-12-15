@@ -41,6 +41,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 import os
+import socket
 
 from torch.cuda.amp import autocast, GradScaler
 
@@ -646,8 +647,6 @@ class EncoderUNet(nn.Module):
     def forward(self, vector1, vector2, scalars):
         x = self.extencoder(vector1, vector2, scalars)
         return self.unet(x)
-
-    
 
 
 
@@ -1361,12 +1360,18 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
     #######################################################################
 
 
+def find_unused_port():
+    """Find an unused port on the local machine."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(('', 0))  # Bind to any free port
+        return s.getsockname()[1]
+
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
-    
+    os.environ['MASTER_PORT'] = str(find_unused_port())  # Use a dynamic port
+
     dist.init_process_group(
-        "nccl", 
+        backend="nccl",  # You can replace 'nccl' with 'gloo' or 'mpi' if needed
         rank=rank, 
         world_size=world_size,
         timeout=timedelta(minutes=60)
