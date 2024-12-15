@@ -20,6 +20,8 @@ from torch.utils.data import DataLoader,Dataset,random_split,Subset
 #from torchvision import transforms
 #from torchsummary import summary
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import LinearLR
+from torch.optim.lr_scheduler import SequentialLR
 
 from torch.optim import AdamW
 
@@ -545,14 +547,24 @@ class ExtEncoder(nn.Module):
 
     
 
+# Common BatchNorm configuration
+def get_batchnorm2d(num_features):
+    return nn.BatchNorm2d(
+        num_features,
+        eps=1e-5,  # Standard epsilon
+        momentum=0.1,  # Standard momentum
+        track_running_stats=True,
+        affine=True
+    )
+
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ConvBlock, self).__init__()
         self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv1_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
-        self.relu1 = nn.ReLU(inplace=False)
+        self.conv1_bn = get_batchnorm2d(out_channels)
+        self.relu1 = nn.ReLU(inplace=False)  # Consistent inplace=False for stability
         self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.conv2_bn = get_batchnorm2d(out_channels)
         self.relu2 = nn.ReLU(inplace=False)
 
     def forward(self, x):
@@ -563,7 +575,6 @@ class ConvBlock(nn.Module):
         x = self.conv2_bn(x)
         x = self.relu2(x)
         return x
-
 
 class EncoderBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -587,58 +598,71 @@ class DecoderBlock(nn.Module):
         x = torch.cat((x, conv_features), dim=1)
         x = self.conv_block(x)
         return x
+    
+
+    
 
 class UNet(nn.Module):
     def __init__(self, in_channels, out_channels, resize_out, freeze_encoder):
         super(UNet, self).__init__()
         
-        #self.resize_in = nn.Upsample(size=(resize_in, resize_in), mode='bilinear', align_corners=False)
+        # Replace resize_out with a more controlled upsampling approach
+        self.final_size = resize_out
         
         self.encoder1 = EncoderBlock(in_channels, 32)
         self.encoder2 = EncoderBlock(32, 64)
         self.encoder3 = EncoderBlock(64, 128)
-        #self.encoder4 = EncoderBlock(256, 512)
         
         self.bottleneck = ConvBlock(128, 256)
         
-        #self.decoder4 = DecoderBlock(1024, 512)
         self.decoder3 = DecoderBlock(256, 128)
         self.decoder2 = DecoderBlock(128, 64)
         self.decoder1 = DecoderBlock(64, 32)
 
-        self.resize_out = nn.Upsample(size=(resize_out, resize_out), mode='bilinear', align_corners=False)
-        
         self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.final_conv_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
-        self.final_ReLU = nn.ReLU(inplace=False)
-
-        # New: Option to freeze encoder layers
-        if freeze_encoder:
-            for encoder in [self.encoder1, self.encoder2, self.encoder3,self.bottleneck]:
-                for param in encoder.parameters():
-                    param.requires_grad = False
+        self.final_conv_bn = get_batchnorm2d(out_channels)
+        self.final_ReLU = nn.ReLU(inplace=True)
         
+        # Add progressive upsampling layers
+        self.upsample1 = nn.Upsample(scale_factor=1.5, mode='bilinear', align_corners=True)
+        self.conv_up1 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn_up1 = get_batchnorm2d(out_channels)
+        
+        self.upsample2 = nn.Upsample(size=(self.final_size, self.final_size), 
+                                    mode='bilinear', align_corners=True)
+        self.conv_up2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
+        self.bn_up2 = get_batchnorm2d(out_channels)
+
     def forward(self, x):
-        #xr = self.resize_in(x)
-    
         f1, p1 = self.encoder1(x)
         f2, p2 = self.encoder2(p1)
         f3, p3 = self.encoder3(p2)
-        #f4, p4 = self.encoder4(p3)
     
         bottleneck = self.bottleneck(p3)
     
-        #u4 = self.decoder4(bottleneck, f4)
         u3 = self.decoder3(bottleneck, f3)
         u2 = self.decoder2(u3, f2)
         u1 = self.decoder1(u2, f1)
     
-        
         output = self.final_conv(u1)
         output = self.final_conv_bn(output)
         output = self.final_ReLU(output)
-        output = self.resize_out(output)
-    
+        
+        # Progressive upsampling with additional convolutions
+        output = self.upsample1(output)
+        output = self.conv_up1(output)
+        output = self.bn_up1(output)
+        output = F.relu(output)
+        
+        output = self.upsample2(output)
+        output = self.conv_up2(output)
+        output = self.bn_up2(output)
+        output = F.relu(output)
+        
+        # Add residual connection
+        output = output + F.interpolate(x, size=(self.final_size, self.final_size), 
+                                      mode='bilinear', align_corners=True)
+        
         return output
 
 class EncoderUNet(nn.Module):
@@ -677,96 +701,76 @@ class ExtDecoder(nn.Module):
 
     def forward(self, latent_image):
         x = latent_image.view(latent_image.size(0), -1)
-        x = F.relu(self.fc(x))
-        reconstructed_vector1 = self.vector_fc1(x)
-        reconstructed_vector2 = self.vector_fc2(x)
+        x = F.relu(self.fc(x))  # Add ReLU activation
+        
+        # Add dropout for regularization
+        x = F.dropout(x, p=0.1, training=self.training)
+        
+        # Reconstruct vectors with tanh to bound the output
+        reconstructed_vector1 = torch.tanh(self.vector_fc1(x)) * 130  # Scale to [-130, 130]
+        reconstructed_vector2 = torch.tanh(self.vector_fc2(x)) * 130
+        
+        # Ensure vector2 > vector1
+        reconstructed_vector2 = reconstructed_vector1 + F.softplus(reconstructed_vector2 - reconstructed_vector1)
+        
+        # Reconstruct scalars with clamping
         reconstructed_scalars = self.scalar_fc(x)
+        reconstructed_scalars = torch.clamp(reconstructed_scalars, min=-130, max=130)
+        
         return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
 
-class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, dropout_prob=0.0):
-        super(ConvBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1)
-        self.conv1_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
-        self.relu1 = nn.ReLU(inplace=False)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1)
-        self.conv2_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
-        self.relu2 = nn.ReLU(inplace=False)
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = self.conv1_bn(x)
-        x = self.relu1(x)
-        x = self.conv2(x)
-        x = self.conv2_bn(x)
-        x = self.relu2(x)
-        return x
-
-
-class EncoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(EncoderBlock, self).__init__()
-        self.conv_block = ConvBlock(in_channels, out_channels)
-        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
-
-    def forward(self, x):
-        f = self.conv_block(x)
-        p = self.pool(f)
-        return f, p
-
-class DecoderBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(DecoderBlock, self).__init__()
-        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
-        self.conv_block = ConvBlock(out_channels+out_channels, out_channels)
-
-    def forward(self, x, conv_features):
-        x = self.conv_transpose(x)
-        x = torch.cat((x, conv_features), dim=1)
-        x = self.conv_block(x)
-        return x
 
 class UNet2(nn.Module):
-    def __init__(self, in_channels, out_channels, resize_in,freeze_encoder):
+    def __init__(self, in_channels, out_channels, resize_in, freeze_encoder):
         super(UNet2, self).__init__()
         
-        self.resize_in = nn.Upsample(size=(resize_in, resize_in), mode='bilinear', align_corners=False)
+        # Progressive upsampling for input resizing
+        self.upsample1 = nn.Upsample(scale_factor=1.5, mode='bilinear', align_corners=True)
+        self.conv_up1 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn_up1 = get_batchnorm2d(in_channels)
         
-        self.encoder1 = EncoderBlock(in_channels, 32)
+        self.upsample2 = nn.Upsample(size=(resize_in, resize_in), mode='bilinear', align_corners=True)
+        self.conv_up2 = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)
+        self.bn_up2 = get_batchnorm2d(in_channels)
+        
+        self.encoder1 = EncoderBlock(in_channels, 32)  # Use existing EncoderBlock
         self.encoder2 = EncoderBlock(32, 64)
         self.encoder3 = EncoderBlock(64, 128)
-        #self.encoder4 = EncoderBlock(256, 512)
         
         self.bottleneck = ConvBlock(128, 256)
         
-        #self.decoder4 = DecoderBlock(1024, 512)
-        self.decoder3 = DecoderBlock(256, 128)
+        self.decoder3 = DecoderBlock(256, 128)  # Use existing DecoderBlock
         self.decoder2 = DecoderBlock(128, 64)
         self.decoder1 = DecoderBlock(64, 32)
-
-        #self.resize_out = nn.Upsample(size=(resize_out, resize_out), mode='bilinear', align_corners=False)
         
         self.final_conv = nn.Conv2d(32, out_channels, kernel_size=1, padding=0)
-        self.final_conv_bn = nn.BatchNorm2d(out_channels, track_running_stats=True, momentum=0.1)
+        self.final_conv_bn = get_batchnorm2d(out_channels)  # Use common BatchNorm config
         self.final_ReLU = nn.ReLU(inplace=False)
-
-        # New: Option to freeze encoder layers
+        
+        # Option to freeze encoder layers
         if freeze_encoder:
             for encoder in [self.decoder1, self.decoder2, self.decoder3, self.bottleneck]:
                 for param in encoder.parameters():
                     param.requires_grad = False
         
     def forward(self, x):
-        xr = self.resize_in(x)
+        # Progressive upsampling of input
+        x = self.upsample1(x)
+        x = self.conv_up1(x)
+        x = self.bn_up1(x)
+        x = F.relu(x)
+        
+        x = self.upsample2(x)
+        x = self.conv_up2(x)
+        x = self.bn_up2(x)
+        xr = F.relu(x)
     
         f1, p1 = self.encoder1(xr)
         f2, p2 = self.encoder2(p1)
         f3, p3 = self.encoder3(p2)
-        #f4, p4 = self.encoder4(p3)
     
         bottleneck = self.bottleneck(p3)
     
-        #u4 = self.decoder4(bottleneck, f4)
         u3 = self.decoder3(bottleneck, f3)
         u2 = self.decoder2(u3, f2)
         u1 = self.decoder1(u2, f1)
@@ -774,7 +778,6 @@ class UNet2(nn.Module):
         output = self.final_conv(u1)
         output = self.final_conv_bn(output)
         output = self.final_ReLU(output)
-        
     
         return output
 
@@ -808,76 +811,75 @@ def initialize_weights(model):
     Optimized weight initialization for EncoderUNet and UNetDecoder architectures
     """
     for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            # Conv layers in UNet blocks - using He initialization for ReLU
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if isinstance(m, nn.BatchNorm2d):
+            # More careful BatchNorm initialization
+            nn.init.constant_(m.weight, 1.0)
+            nn.init.constant_(m.bias, 0.0)
+            # Initialize running_mean and running_var
+            if hasattr(m, 'running_mean'):
+                m.running_mean.zero_()
+            if hasattr(m, 'running_var'):
+                m.running_var.fill_(1.0)
+                
+        elif isinstance(m, nn.Conv2d):
+            # Use Kaiming initialization with smaller gain for stability
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0.01)
+                nn.init.zeros_(m.bias)  # Initialize biases to zero
                 
         elif isinstance(m, nn.ConvTranspose2d):
-            # Transposed conv layers in decoder blocks
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+            # Similar initialization for transposed convolutions
+            nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='relu')
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0.01)
+                nn.init.zeros_(m.bias)
                 
         elif isinstance(m, nn.Linear):
             if m.in_features == 104 * 2:  # vector_fc in ExtEncoder
-                # Special initialization for processing input vectors
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.constant_(m.bias, 0)
+                # Use smaller initialization for stability
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                nn.init.zeros_(m.bias)
             elif m.out_features == 512:  # fc in ExtDecoder
-                # Initialization for feature extraction
-                nn.init.xavier_uniform_(m.weight, gain=1.414)
-                nn.init.constant_(m.bias, 0)
+                nn.init.xavier_uniform_(m.weight, gain=0.5)
+                nn.init.zeros_(m.bias)
             else:  # Other linear layers
-                # Scale based on input size for better gradient flow
                 bound = 1 / math.sqrt(m.in_features)
-                nn.init.uniform_(m.weight, -bound, bound)
+                nn.init.uniform_(m.weight, -bound/2, bound/2)  # Reduced range
                 if m.bias is not None:
-                    nn.init.uniform_(m.bias, -bound, bound)
-                    
-        elif isinstance(m, nn.BatchNorm2d):
-            # Standard initialization for batch norm
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-            
-        elif isinstance(m, nn.MaxPool2d):
-            # MaxPool doesn't have parameters but included for completeness
-            pass
+                    nn.init.zeros_(m.bias)
 
 def initialize_encoder_specific(encoder):
     """
-    Specific initialization for ExtEncoder
+    Specific initialization for ExtEncoder with more conservative values
     """
     # Initialize vector processing layers
-    nn.init.xavier_uniform_(encoder.vector_fc.weight)
-    nn.init.constant_(encoder.vector_fc.bias, 0)
+    nn.init.xavier_uniform_(encoder.vector_fc.weight, gain=0.5)
+    nn.init.zeros_(encoder.vector_fc.bias)
     
     # Initialize scalar processing layers
     for fc in encoder.scalar_fc:
-        nn.init.xavier_uniform_(fc.weight)
-        nn.init.constant_(fc.bias, 0)
+        nn.init.xavier_uniform_(fc.weight, gain=0.5)
+        nn.init.zeros_(fc.bias)
     
-    # Initialize combined layer with careful scaling
-    nn.init.xavier_uniform_(encoder.combined_fc.weight, gain=1.414)
-    nn.init.constant_(encoder.combined_fc.bias, 0.01)
+    # Initialize combined layer
+    nn.init.xavier_uniform_(encoder.combined_fc.weight, gain=0.5)
+    nn.init.zeros_(encoder.combined_fc.bias)
 
 def initialize_decoder_specific(decoder):
     """
-    Specific initialization for ExtDecoder
+    Specific initialization for ExtDecoder with more conservative values
     """
     # Initialize main feature extraction
-    nn.init.xavier_uniform_(decoder.fc.weight, gain=1.414)
-    nn.init.constant_(decoder.fc.bias, 0)
+    nn.init.xavier_uniform_(decoder.fc.weight, gain=0.5)
+    nn.init.zeros_(decoder.fc.bias)
     
     # Initialize vector reconstruction layers
     for fc in [decoder.vector_fc1, decoder.vector_fc2]:
-        nn.init.xavier_uniform_(fc.weight)
-        nn.init.constant_(fc.bias, 0)
+        nn.init.xavier_uniform_(fc.weight, gain=0.5)
+        nn.init.zeros_(fc.bias)
     
     # Initialize scalar reconstruction
-    nn.init.xavier_uniform_(decoder.scalar_fc.weight)
-    nn.init.constant_(decoder.scalar_fc.bias, 0)
+    nn.init.xavier_uniform_(decoder.scalar_fc.weight, gain=0.5)
+    nn.init.zeros_(decoder.scalar_fc.bias)  # Fixed: was using decoder.fc.bias
 
     
 # training_utils.py########################################################
@@ -956,7 +958,18 @@ def weighted_l1_loss(input, target, weights):
 
 
 def setup_training(encoderunet, unetdecoder, resume=0):
-    lr = 1e-4
+    # Reduce initial learning rate
+    lr = 1e-3  
+    
+    # Use a more stable optimizer configuration
+    optimizer = AdamW(
+        list(encoderunet.parameters()) + list(unetdecoder.parameters()),
+        lr=lr,
+        weight_decay=1e-4,
+        betas=(0.9, 0.999),
+        eps=1e-8
+    )
+    
     criterion = nn.MSELoss().to(device)
     scaler = GradScaler()
     
@@ -968,7 +981,6 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         # Handle state dict for DDP models
         encoderunet_state = {}
         for k, v in checkpoint['encoderunet_state_dict'].items():
-            # Remove 'module.' if it exists (from DDP) or add if needed
             if k.startswith('module.'):
                 encoderunet_state[k] = v
             else:
@@ -986,8 +998,6 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         unetdecoder.load_state_dict(unetdecoder_state)
         
         # Move optimizer state to correct device after loading
-        optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                         lr=lr, weight_decay=1e-4)
         optimizer_state = checkpoint['optimizer_state_dict']
         
         # Ensure optimizer state tensors are on the correct device
@@ -1004,50 +1014,65 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         train_accuracies = checkpoint['train_accuracies']
         val_accuracies = checkpoint['val_accuracies']
         
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
+        # Load scheduler state
+        scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=20,  # Consistent with non-resume case
+            T_mult=2,
+            eta_min=1e-6
+        )
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
         # Handle scaler state
         if 'scaler_state_dict' in checkpoint:
-            scaler_state = checkpoint['scaler_state_dict']
-            scaler.load_state_dict(scaler_state)
-        else:
-            scaler_state = None
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
-        return (optimizer, scheduler, criterion, start_epoch, 
-                train_losses, val_losses, train_accuracies, 
-                val_accuracies, scaler)
     else:
-        
-
         initialize_weights(encoderunet)
         initialize_encoder_specific(encoderunet.module.extencoder)
-
         initialize_weights(unetdecoder)
         initialize_decoder_specific(unetdecoder.module.extdecoder)
 
-        optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                         lr=lr, weight_decay=1e-4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
+        # Add warmup scheduler
+        warmup_scheduler = LinearLR(
+            optimizer,
+            start_factor=0.1,
+            end_factor=1.0,
+            total_iters=5  # Warmup for 5 epochs
+        )
+        
+        main_scheduler = CosineAnnealingWarmRestarts(
+            optimizer,
+            T_0=20,
+            T_mult=2,
+            eta_min=1e-5
+        )
+        
+        scheduler = SequentialLR(
+            optimizer,
+            schedulers=[warmup_scheduler, main_scheduler],
+            milestones=[5]  # Switch to main scheduler after 5 epochs
+        )
+        
         start_epoch = 0
         train_losses = []
         val_losses = []
         train_accuracies = []
         val_accuracies = []
-        
-        return (optimizer, scheduler, criterion, start_epoch, 
-                train_losses, val_losses, train_accuracies, 
-                val_accuracies, scaler)
+    
+    return (optimizer, scheduler, criterion, start_epoch, 
+            train_losses, val_losses, train_accuracies, 
+            val_accuracies, scaler)
 
 
 # training_loop.py
 
-def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0):
+def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, world_size, resume=0):
     # Get training setup
     optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies, scaler = setup_training(encoderunet, unetdecoder, resume)
     
-    # Add anomaly detection during training
-    torch.autograd.set_detect_anomaly(True)
+    # Remove this line
+    # torch.autograd.set_detect_anomaly(True)  
 
     # Get rank for printing
     rank = dist.get_rank()
@@ -1068,163 +1093,49 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
     
     line_length = 155
     
+    # Add max gradient norm
+    max_grad_norm = 1.0
+    
+    # Add loss scaling factors
+    forward_loss_scale = 1.0
+    backward_loss_scale = 0.1
+    consistency_loss_scale = 0.01
+    penalty_loss_scale = 0.1
+    
     for epoch in range(start_epoch, EPOCHS):
-        # Synchronize GPUs before starting epoch
-        #torch.cuda.synchronize()
-        #dist.barrier()
-
-        # Training
-        encoderunet.train()
-        unetdecoder.train()
-        
-        running_train_losses = [0.0] * len(train_loaders)
-        running_train_accuracies = [0.0] * len(train_loaders)
-        
-        start_time = time.time()
-        
-        for i, train_loader in enumerate(train_loaders):
-            loader_loss_sum = 0.0
-            loader_accuracy_sum = 0.0
+        try:
+            # Synchronize at epoch start
+            #dist.barrier()
             
-            for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(train_loader):
-                # Move data to device
-                v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
-                v1_weight, v2_weight = v1_weight.to(device), v2_weight.to(device)
-                arrays, arrays_p = arrays.to(device), arrays_p.to(device)
-                
-                arrays = arrays.squeeze(1)
-                arrays_p = arrays_p.squeeze(1)
-                
-                # Wrap training steps with autocast
-                with autocast():
-                    # Forward pass through encoder-unet
-                    outputs = encoderunet(v1, v2, scalars)
-                    accuracy = 0
-                    
-                    # Compute "forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars[:,0,0]
-                    loss_for = (l1_loss_per_sample * weight).mean()
-                    
-                    # First decoder pass
-                    arrays_con = torch.cat([arrays_p, arrays], dim=1)
-                    v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
-                    
-                    # Second encoder pass
-                    outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1), 
-                                          v2_reconstructed.unsqueeze(1), 
-                                          scalars_reconstructed.unsqueeze(1))
-                    
-                    # Compute "second pass forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
-                    loss_for_2 = (l1_loss_per_sample * weight).mean()
-                    
-                    # Second decoder pass
-                    arrays_p = outputs[:-1]
-                    main_batch = outputs[1:]
-                    arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
-                    v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
-                    
-                    # Prepare tensors
-                    v1, v2 = v1.squeeze(1), v2.squeeze(1)
-                    v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
-                    scalars = scalars.squeeze(1)
-                    
-                    # Penalty losses
-                    penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
-                                             v1_reconstructed - v2_reconstructed,
-                                             torch.zeros_like(v2_reconstructed)).sum().clone()
-                    
-                    penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
-                                               v1_reconstructed_2 - v2_reconstructed_2,
-                                               torch.zeros_like(v2_reconstructed_2)).sum().clone()
-                    
-                    # Consistency losses
-                    if v1_reconstructed.size(0) > 1:
-                        mse_loss_v1_diff = weighted_l1_loss(
-                            v1_reconstructed[:-1, -52:],
-                            v1_reconstructed[1:, :52],
-                            v1_weight[:-1, -52:]
-                        )
-                        mse_loss_v2_diff = weighted_l1_loss(
-                            v2_reconstructed[:-1, -52:],
-                            v2_reconstructed[1:, :52],
-                            v2_weight[:-1, -52:]
-                        )
-                        mse_loss_v1_diff_2 = weighted_l1_loss(
-                            v1_reconstructed_2[:-1, -52:],
-                            v1_reconstructed_2[1:, :52],
-                            v1_weight[1:-1, -52:]
-                        )
-                        mse_loss_v2_diff_2 = weighted_l1_loss(
-                            v2_reconstructed_2[:-1, -52:],
-                            v2_reconstructed_2[1:, :52],
-                            v2_weight[1:-1, -52:]
-                        )
-                        
-                        consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff +
-                                          mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
-                    
-                    # Reconstruction losses
-                    mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
-                    mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
-                    mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
-                    
-                    loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars +
-                                penalty_loss * 10)
-                    
-                    mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
-                    mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
-                    mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
-                    
-                    loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + mse_loss_scalars_2 +
-                                  penalty_loss_2 * 10)
-                    
-                    # Total loss
-                    loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
-                
-                # Optimization step with gradient scaling
-                optimizer.zero_grad()
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-                
-                # Synchronize after optimization
-                #torch.cuda.synchronize()
-                #dist.barrier()
-                
-                loader_loss_sum += loss.item()
-                loader_accuracy_sum += accuracy
+            # Initialize running losses and accuracies for this epoch
+            running_train_losses = [0.0] * len(train_loaders)
+            running_train_accuracies = [0.0] * len(train_loaders)
             
-            # Calculate averages for this loader
-            num_batches = len(train_loader)
-            running_train_losses[i] = loader_loss_sum / num_batches
-            running_train_accuracies[i] = loader_accuracy_sum / num_batches
-
-            # Print progress
-            #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(train_loaders)}] "
-            #      f"Batch [{batch_idx+1}/{len(train_loader)}]  "
-            #      f"Temp. Train. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
-            #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
-            #      f"{loss.item():.2e}  Temp. Train. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
-
-
-        # Validation
-        encoderunet.eval()
-        unetdecoder.eval()
-        
-        with torch.no_grad(), autocast():
-            running_val_losses = [0.0] * len(val_loaders)
-            running_val_accuracies = [0.0] * len(val_loaders)
+            # Training
+            encoderunet.train()
+            unetdecoder.train()
             
-            for i, val_loader in enumerate(val_loaders):
+            start_time = time.time()
+            
+            for i, train_loader in enumerate(train_loaders):
+                # Initialize loader metrics
                 loader_loss_sum = 0.0
                 loader_accuracy_sum = 0.0
                 
-                for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(val_loader):
+                for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(train_loader):
+                    # Ensure all processes have same batch size
+                    batch_size = v1.size(0)
+                    min_batch_size = torch.tensor([batch_size], device=device)
+                    dist.all_reduce(min_batch_size, op=dist.ReduceOp.MIN)
+                    if batch_size > min_batch_size.item():
+                        v1 = v1[:min_batch_size]
+                        v2 = v2[:min_batch_size]
+                        scalars = scalars[:min_batch_size]
+                        v1_weight = v1_weight[:min_batch_size]
+                        v2_weight = v2_weight[:min_batch_size]
+                        arrays = arrays[:min_batch_size]
+                        arrays_p = arrays_p[:min_batch_size]
+                    
                     # Move data to device
                     v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
                     v1_weight, v2_weight = v1_weight.to(device), v2_weight.to(device)
@@ -1233,189 +1144,346 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     arrays = arrays.squeeze(1)
                     arrays_p = arrays_p.squeeze(1)
                     
-                    # Forward pass through encoder-unet
-                    outputs = encoderunet(v1, v2, scalars)
-                    #accuracy = calculate_gamma_index(outputs, arrays)
-                    accuracy = 0
-
-                    # Compute "forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars[:,0,0]
-                    loss_for = (l1_loss_per_sample * weight).mean()
-                    
-                    # First decoder pass
-                    arrays_con = torch.cat([arrays_p, arrays], dim=1)
-                    v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
-                    
-                    # Second encoder pass
-                    outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1),
-                                          v2_reconstructed.unsqueeze(1),
-                                          scalars_reconstructed.unsqueeze(1))
-                    
-                    # Compute "second pass forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
-                    loss_for_2 = (l1_loss_per_sample * weight).mean()
-                    
-                    # Second decoder pass setup
-                    arrays_p = outputs[:-1]
-                    main_batch = outputs[1:]
-                    arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
-                    v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
-                    
-                    # Prepare tensors
-                    v1, v2 = v1.squeeze(1), v2.squeeze(1)
-                    v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
-                    scalars = scalars.squeeze(1)
-                    
-                    # Penalty losses
-                    penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
-                                             v1_reconstructed - v2_reconstructed,
-                                             torch.zeros_like(v2_reconstructed)).sum().clone()
-                    
-                    penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
-                                               v1_reconstructed_2 - v2_reconstructed_2,
-                                               torch.zeros_like(v2_reconstructed_2)).sum().clone()
-                    
-                    # Consistency losses
-                    if v1_reconstructed.size(0) > 1:
-                        mse_loss_v1_diff = weighted_l1_loss(
-                            v1_reconstructed[:-1, -52:],
-                            v1_reconstructed[1:, :52],
-                            v1_weight[:-1, -52:]
-                        )
-                        mse_loss_v2_diff = weighted_l1_loss(
-                            v2_reconstructed[:-1, -52:],
-                            v2_reconstructed[1:, :52],
-                            v2_weight[:-1, -52:]
-                        )
-                        mse_loss_v1_diff_2 = weighted_l1_loss(
-                            v1_reconstructed_2[:-1, -52:],
-                            v1_reconstructed_2[1:, :52],
-                            v1_weight[1:-1, -52:]
-                        )
-                        mse_loss_v2_diff_2 = weighted_l1_loss(
-                            v2_reconstructed_2[:-1, -52:],
-                            v2_reconstructed_2[1:, :52],
-                            v2_weight[1:-1, -52:]
-                        )
+                    # Wrap training steps with autocast
+                    with autocast():
+                        # Forward pass through encoder-unet
+                        outputs = encoderunet(v1, v2, scalars)
+                        accuracy = 0
                         
-                        consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff +
-                                          mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
-                    
-                    # Reconstruction losses
-                    mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
-                    mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
-                    mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
-                    
-                    loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars +
-                                penalty_loss * 10)
-                    
-                    mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
-                    mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
-                    mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
-                    
-                    loss_back_2 = (mse_loss_v1_2 + mse_loss_v2_2 + mse_loss_scalars_2 +
-                                  penalty_loss_2 * 10)
-                    
-                    # Total loss
-                    loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
-                    
-                    loader_loss_sum += loss.item()
-                    loader_accuracy_sum += accuracy
+                        # Compute "forward loss"
+                        l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
+                        l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                        weight = 1/scalars[:,0,0]
+                        loss_for = forward_loss_scale * (l1_loss_per_sample * weight).mean()
+                        
+                        # First decoder pass
+                        arrays_con = torch.cat([arrays_p, arrays], dim=1)
+                        v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
+                        
+                        # Second encoder pass
+                        outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1), 
+                                              v2_reconstructed.unsqueeze(1), 
+                                              scalars_reconstructed.unsqueeze(1))
+                        
+                        # Compute "second pass forward loss"
+                        l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
+                        l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                        weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
+                        loss_for_2 = forward_loss_scale * (l1_loss_per_sample * weight).mean()
+                        
+                        # Second decoder pass
+                        arrays_p = outputs[:-1]
+                        main_batch = outputs[1:]
+                        arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
+                        v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
+                        
+                        # Prepare tensors
+                        v1, v2 = v1.squeeze(1), v2.squeeze(1)
+                        v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
+                        scalars = scalars.squeeze(1)
+                        
+                        # Penalty losses
+                        penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
+                                                 v1_reconstructed - v2_reconstructed,
+                                                 torch.zeros_like(v2_reconstructed)).sum().clone()
+                        
+                        penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
+                                                   v1_reconstructed_2 - v2_reconstructed_2,
+                                                   torch.zeros_like(v2_reconstructed_2)).sum().clone()
+                        
+                        # Consistency losses
+                        if v1_reconstructed.size(0) > 1:
+                            mse_loss_v1_diff = weighted_l1_loss(
+                                v1_reconstructed[:-1, -52:],
+                                v1_reconstructed[1:, :52],
+                                v1_weight[:-1, -52:]
+                            )
+                            mse_loss_v2_diff = weighted_l1_loss(
+                                v2_reconstructed[:-1, -52:],
+                                v2_reconstructed[1:, :52],
+                                v2_weight[:-1, -52:]
+                            )
+                            mse_loss_v1_diff_2 = weighted_l1_loss(
+                                v1_reconstructed_2[:-1, -52:],
+                                v1_reconstructed_2[1:, :52],
+                                v1_weight[1:-1, -52:]
+                            )
+                            mse_loss_v2_diff_2 = weighted_l1_loss(
+                                v2_reconstructed_2[:-1, -52:],
+                                v2_reconstructed_2[1:, :52],
+                                v2_weight[1:-1, -52:]
+                            )
+                            
+                            consistency_loss = consistency_loss_scale * (mse_loss_v1_diff + mse_loss_v2_diff +
+                                                                          mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
+                        
+                        # Reconstruction losses
+                        mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
+                        mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
+                        mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
+                        
+                        loss_back = backward_loss_scale * (mse_loss_v1 + mse_loss_v2 + 
+                                                            mse_loss_scalars + penalty_loss_scale * penalty_loss)
+                        
+                        mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
+                        mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
+                        mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
+                        
+                        loss_back_2 = backward_loss_scale * (mse_loss_v1_2 + mse_loss_v2_2 + 
+                                                              mse_loss_scalars_2 + penalty_loss_scale * penalty_loss_2)
+                        
+                        # Total loss
+                        loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
+                        
+                        # Perform backward pass directly
+                        optimizer.zero_grad()
+                        scaler.scale(loss).backward()
+                        scaler.unscale_(optimizer)
+                        torch.nn.utils.clip_grad_norm_(encoderunet.parameters(), max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(unetdecoder.parameters(), max_grad_norm)
+                        scaler.step(optimizer)
+                        scaler.update()
+                        
+                        loader_loss_sum += loss.item()
+                        loader_accuracy_sum += accuracy
                 
                 # Calculate averages for this loader
-                num_batches = len(val_loader)
-                running_val_losses[i] = loader_loss_sum / num_batches
-                running_val_accuracies[i] = loader_accuracy_sum / num_batches
+                num_batches = len(train_loader)
+                running_train_losses[i] = loader_loss_sum / num_batches
+                running_train_accuracies[i] = loader_accuracy_sum / num_batches
 
-                #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(val_loaders)}] "
-                #      f"Batch [{batch_idx+1}/{len(val_loader)}]  "
-                #      f"Temp. Val. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
+                # Print progress
+                #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(train_loaders)}] "
+                #      f"Batch [{batch_idx+1}/{len(train_loader)}]  "
+                #      f"Temp. Train. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
                 #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
-                #      f"{loss.item():.2e}  Temp. Val. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
+                #      f"{loss.item():.2e}  Temp. Train. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
+
+
+
+            # Validation
+            encoderunet.eval()
+            unetdecoder.eval()
+            
+            with torch.no_grad(), autocast():
+                running_val_losses = [0.0] * len(val_loaders)
+                running_val_accuracies = [0.0] * len(val_loaders)
+                
+                for i, val_loader in enumerate(val_loaders):
+                    loader_loss_sum = 0.0
+                    loader_accuracy_sum = 0.0
+                    
+                    for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(val_loader):
+                        # Move data to device
+                        v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
+                        v1_weight, v2_weight = v1_weight.to(device), v2_weight.to(device)
+                        arrays, arrays_p = arrays.to(device), arrays_p.to(device)
+                        
+                        arrays = arrays.squeeze(1)
+                        arrays_p = arrays_p.squeeze(1)
+                        
+                        # Forward pass through encoder-unet
+                        outputs = encoderunet(v1, v2, scalars)
+                        #accuracy = calculate_gamma_index(outputs, arrays)
+                        accuracy = 0
+
+                        # Compute "forward loss"
+                        l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
+                        l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                        weight = 1/scalars[:,0,0]
+                        loss_for = (l1_loss_per_sample * weight).mean()
+                        
+                        # First decoder pass
+                        arrays_con = torch.cat([arrays_p, arrays], dim=1)
+                        v1_reconstructed, v2_reconstructed, scalars_reconstructed = unetdecoder(arrays_con)
+                        
+                        # Second encoder pass
+                        outputs_2 = encoderunet(v1_reconstructed.unsqueeze(1),
+                                              v2_reconstructed.unsqueeze(1),
+                                              scalars_reconstructed.unsqueeze(1))
+                        
+                        # Compute "second pass forward loss"
+                        l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
+                        l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
+                        weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
+                        loss_for_2 = (l1_loss_per_sample * weight).mean()
+                        
+                        # Second decoder pass setup
+                        arrays_p = outputs[:-1]
+                        main_batch = outputs[1:]
+                        arrays_con_2 = torch.cat([arrays_p, main_batch], dim=1)
+                        v1_reconstructed_2, v2_reconstructed_2, scalars_reconstructed_2 = unetdecoder(arrays_con_2)
+                        
+                        # Prepare tensors
+                        v1, v2 = v1.squeeze(1), v2.squeeze(1)
+                        v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
+                        scalars = scalars.squeeze(1)
+                        
+                        # Penalty losses
+                        penalty_loss = torch.where(v2_reconstructed < v1_reconstructed,
+                                                 v1_reconstructed - v2_reconstructed,
+                                                 torch.zeros_like(v2_reconstructed)).sum().clone()
+                        
+                        penalty_loss_2 = torch.where(v2_reconstructed_2 < v1_reconstructed_2,
+                                                   v1_reconstructed_2 - v2_reconstructed_2,
+                                                   torch.zeros_like(v2_reconstructed_2)).sum().clone()
+                        
+                        # Consistency losses
+                        if v1_reconstructed.size(0) > 1:
+                            mse_loss_v1_diff = weighted_l1_loss(
+                                v1_reconstructed[:-1, -52:],
+                                v1_reconstructed[1:, :52],
+                                v1_weight[:-1, -52:]
+                            )
+                            mse_loss_v2_diff = weighted_l1_loss(
+                                v2_reconstructed[:-1, -52:],
+                                v2_reconstructed[1:, :52],
+                                v2_weight[:-1, -52:]
+                            )
+                            mse_loss_v1_diff_2 = weighted_l1_loss(
+                                v1_reconstructed_2[:-1, -52:],
+                                v1_reconstructed_2[1:, :52],
+                                v1_weight[1:-1, -52:]
+                            )
+                            mse_loss_v2_diff_2 = weighted_l1_loss(
+                                v2_reconstructed_2[:-1, -52:],
+                                v2_reconstructed_2[1:, :52],
+                                v2_weight[1:-1, -52:]
+                            )
+                            
+                            consistency_loss = consistency_loss_scale * (mse_loss_v1_diff + mse_loss_v2_diff +
+                                                                          mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
+                        
+                        # Reconstruction losses
+                        mse_loss_v1 = weighted_l1_loss(v1_reconstructed, v1, v1_weight)
+                        mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
+                        mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
+                        
+                        loss_back = backward_loss_scale * (mse_loss_v1 + mse_loss_v2 + 
+                                                            mse_loss_scalars + penalty_loss_scale * penalty_loss)
+                        
+                        mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
+                        mse_loss_v2_2 = weighted_l1_loss(v2_reconstructed_2, v2[1:], v2_weight[1:])
+                        mse_loss_scalars_2 = criterion(scalars_reconstructed_2, scalars[1:]) * 5
+                        
+                        loss_back_2 = backward_loss_scale * (mse_loss_v1_2 + mse_loss_v2_2 + 
+                                                              mse_loss_scalars_2 + penalty_loss_scale * penalty_loss_2)
+                        
+                        # Total loss
+                        loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
+                        
+                        loader_loss_sum += loss.item()
+                        loader_accuracy_sum += accuracy
+                    
+                    # Calculate averages for this loader
+                    num_batches = len(val_loader)
+                    running_val_losses[i] = loader_loss_sum / num_batches
+                    running_val_accuracies[i] = loader_accuracy_sum / num_batches
+
+                    #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(val_loaders)}] "
+                    #      f"Batch [{batch_idx+1}/{len(val_loader)}]  "
+                    #      f"Temp. Val. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
+                    #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
+                    #      f"{loss.item():.2e}  Temp. Val. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
 
 
              # Calculate average metrics for the epoch
-        average_train_loss = sum(running_train_losses) / len(train_loaders)
-        average_train_accuracy = sum(running_train_accuracies) / len(train_loaders)
-        average_val_loss = sum(running_val_losses) / len(val_loaders)
-        average_val_accuracy = sum(running_val_accuracies) / len(val_loaders)
+            average_train_loss = sum(running_train_losses) / len(train_loaders)
+            average_train_accuracy = sum(running_train_accuracies) / len(train_loaders)
+            average_val_loss = sum(running_val_losses) / len(val_loaders)
+            average_val_accuracy = sum(running_val_accuracies) / len(val_loaders)
 
-        # Append to history
-        #train_losses.append(average_train_loss)
-        #train_accuracies.append(average_train_accuracy)
-        #val_losses.append(average_val_loss)
-        #val_accuracies.append(average_val_accuracy)
-        
-        # Step scheduler
-        scheduler.step(epoch)
-        current_lr = optimizer.param_groups[0]['lr']
-        
-        # Calculate elapsed time
-        elapsed_time = time.time() - start_time
-        
-        # Gather losses and accuracies from all GPUs
-        world_size = dist.get_world_size()
-        all_train_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
-        all_train_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
-        all_val_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
-        all_val_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
-        
-        # Convert local values to tensors
-        local_train_loss = torch.tensor([average_train_loss]).to(device)
-        local_train_acc = torch.tensor([average_train_accuracy]).to(device)
-        local_val_loss = torch.tensor([average_val_loss]).to(device)
-        local_val_acc = torch.tensor([average_val_accuracy]).to(device)
-        
-        # Gather from all GPUs
-        dist.all_gather(all_train_losses, local_train_loss)
-        dist.all_gather(all_train_accuracies, local_train_acc)
-        dist.all_gather(all_val_losses, local_val_loss)
-        dist.all_gather(all_val_accuracies, local_val_acc)
-
-        # Calculate global averages
-        global_train_loss = sum([loss.item() for loss in all_train_losses]) / world_size
-        global_train_acc = sum([acc.item() for acc in all_train_accuracies]) / world_size
-        global_val_loss = sum([loss.item() for loss in all_val_losses]) / world_size
-        global_val_acc = sum([acc.item() for acc in all_val_accuracies]) / world_size
-
-        # Print epoch summary with global averages
-        if rank == 0:
-            print(f"Epoch [{epoch+1}/{EPOCHS}] "
-                  f"Avg. Train Loss: {global_train_loss:.4e} "
-                  f"Avg. Train Accuracy: {global_train_acc:.2f} "
-                  f"Avg. Val. Loss: {global_val_loss:.4e} "
-                  f"Avg. Val. Accuracy: {global_val_acc:.2f} "
-                  f"Elap. Time: {elapsed_time:.1f} seconds "
-                  f"Current LR: {current_lr:.4e}")
+            # Append to history
+            #train_losses.append(average_train_loss)
+            #train_accuracies.append(average_train_accuracy)
+            #val_losses.append(average_val_loss)
+            #val_accuracies.append(average_val_accuracy)
             
-            sys.stdout.flush()
-
-        # Store global averages
-        train_losses.append(global_train_loss)
-        train_accuracies.append(global_train_acc)
-        val_losses.append(global_val_loss)
-        val_accuracies.append(global_val_acc)
-
-        # Only save checkpoint from rank 0
-        if rank == 0:
-            checkpoint = {
-                'epoch': epoch,
-                'encoderunet_state_dict': encoderunet.module.state_dict(),
-                'unetdecoder_state_dict': unetdecoder.module.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'scaler_state_dict': scaler.state_dict(),
-                'train_losses': train_losses,
-                'train_accuracies': train_accuracies,
-                'val_losses': val_losses,
-                'val_accuracies': val_accuracies,
-            }
+            # Step scheduler - remove epoch argument
+            scheduler.step()  # Changed from scheduler.step(epoch)
+            current_lr = optimizer.param_groups[0]['lr']
             
-            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_batchnorm_checkpoint.pth')
+            # Calculate elapsed time
+            elapsed_time = time.time() - start_time
+            
+            # Gather losses and accuracies from all GPUs
+            world_size = dist.get_world_size()
+            all_train_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
+            all_train_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
+            all_val_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
+            all_val_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
+            
+            # Convert local values to tensors
+            local_train_loss = torch.tensor([average_train_loss]).to(device)
+            local_train_acc = torch.tensor([average_train_accuracy]).to(device)
+            local_val_loss = torch.tensor([average_val_loss]).to(device)
+            local_val_acc = torch.tensor([average_val_accuracy]).to(device)
+            
+            # Gather from all GPUs
+            dist.all_gather(all_train_losses, local_train_loss)
+            dist.all_gather(all_train_accuracies, local_train_acc)
+            dist.all_gather(all_val_losses, local_val_loss)
+            dist.all_gather(all_val_accuracies, local_val_acc)
+
+            # Calculate global averages
+            global_train_loss = sum([loss.item() for loss in all_train_losses]) / world_size
+            global_train_acc = sum([acc.item() for acc in all_train_accuracies]) / world_size
+            global_val_loss = sum([loss.item() for loss in all_val_losses]) / world_size
+            global_val_acc = sum([acc.item() for acc in all_val_accuracies]) / world_size
+
+            # Print epoch summary with global averages
+            if rank == 0:
+                print(f"Epoch [{epoch+1}/{EPOCHS}] "
+                      f"Avg. Train Loss: {global_train_loss:.4e} "
+                      f"Avg. Train Accuracy: {global_train_acc:.2f} "
+                      f"Avg. Val. Loss: {global_val_loss:.4e} "
+                      f"Avg. Val. Accuracy: {global_val_acc:.2f} "
+                      f"Elap. Time: {elapsed_time:.1f} seconds "
+                      f"Current LR: {current_lr:.4e}")
+                
+                sys.stdout.flush()
+
+            # Store global averages
+            train_losses.append(global_train_loss)
+            train_accuracies.append(global_train_acc)
+            val_losses.append(global_val_loss)
+            val_accuracies.append(global_val_acc)
+
+            # Only save checkpoint from rank 0
+            if rank == 0:
+                checkpoint = {
+                    'epoch': epoch,
+                    'encoderunet_state_dict': encoderunet.module.state_dict(),
+                    'unetdecoder_state_dict': unetdecoder.module.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'train_losses': train_losses,
+                    'train_accuracies': train_accuracies,
+                    'val_losses': val_losses,
+                    'val_accuracies': val_accuracies,
+                }
+                
+                torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_batchnorm_checkpoint.pth')
+
+        except Exception as e:
+            print(f"Error during training: {str(e)}")
+            if rank == 0:
+                # Save checkpoint
+                checkpoint = {
+                    'epoch': epoch,
+                    'encoderunet_state_dict': encoderunet.module.state_dict(),
+                    'unetdecoder_state_dict': unetdecoder.module.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
+                    'scaler_state_dict': scaler.state_dict(),
+                    'train_losses': train_losses,
+                    'val_losses': val_losses,
+                    'train_accuracies': train_accuracies,
+                    'val_accuracies': val_accuracies,
+                }
+                torch.save(checkpoint, 'Cross_CP/emergency_checkpoint.pth')
+            raise
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1432,6 +1500,7 @@ def setup(rank, world_size):
         world_size=world_size,
         timeout=timedelta(minutes=60)
     )
+
     
     # Set device and CUDA settings
     torch.cuda.set_device(rank)
@@ -1447,6 +1516,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
     setup(rank, world_size)
     
     device = torch.device(f'cuda:{rank}')
+    torch.cuda.set_device(device)
     
     train_loaders = []
     val_loaders = []
@@ -1520,8 +1590,15 @@ def train_ddp(rank, world_size, generate_flag, KM):
 
     encoderunet = EncoderUNet(ExtEncoder, vector_dim, scalar_count, latent_image_size, 
                              in_channels, out_channels, resize_out, freeze_encoder=False)
+    # Convert to SyncBatchNorm before DDP
+    encoderunet = nn.SyncBatchNorm.convert_sync_batchnorm(encoderunet)
     encoderunet = encoderunet.to(device)
-    encoderunet = DDP(encoderunet, device_ids=[rank])
+    encoderunet = DDP(
+        encoderunet,
+        device_ids=[rank],
+        find_unused_parameters=False,  # Added this
+        broadcast_buffers=True  # Added this
+    )
 
     vector_dim = 104
     scalar_count = 5
@@ -1532,8 +1609,14 @@ def train_ddp(rank, world_size, generate_flag, KM):
 
     unetdecoder = UNetDecoder(ExtDecoder, vector_dim, scalar_count, latent_image_size,
                              in_channels, out_channels, resize_in, freeze_encoder=False)
+    unetdecoder = nn.SyncBatchNorm.convert_sync_batchnorm(unetdecoder)
     unetdecoder = unetdecoder.to(device)
-    unetdecoder = DDP(unetdecoder, device_ids=[rank])
+    unetdecoder = DDP(
+        unetdecoder,
+        device_ids=[rank],
+        find_unused_parameters=False,
+        broadcast_buffers=True
+    )
 
     if rank == 0:
         print("\nModel devices:")
@@ -1541,7 +1624,9 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, 
+               world_size,  # Pass world_size to train_cross
+               resume=0)
     
     if rank == 0:
         print("Training completed!")
