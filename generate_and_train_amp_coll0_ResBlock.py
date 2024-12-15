@@ -897,38 +897,13 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_checkpoint.pth', 
                               map_location='cpu')
         
-        # Handle state dict for DDP models
-        encoderunet_state = {}
-        for k, v in checkpoint['encoderunet_state_dict'].items():
-            # Remove 'module.' if it exists (from DDP) or add if needed
-            if k.startswith('module.'):
-                encoderunet_state[k] = v
-            else:
-                encoderunet_state[f'module.{k}'] = v
-                
-        unetdecoder_state = {}
-        for k, v in checkpoint['unetdecoder_state_dict'].items():
-            if k.startswith('module.'):
-                unetdecoder_state[k] = v
-            else:
-                unetdecoder_state[f'module.{k}'] = v
+        # Load state dicts directly without module prefix
+        encoderunet.load_state_dict(checkpoint['encoderunet_state_dict'])
+        unetdecoder.load_state_dict(checkpoint['unetdecoder_state_dict'])
         
-        # Load state dicts
-        encoderunet.load_state_dict(encoderunet_state)
-        unetdecoder.load_state_dict(unetdecoder_state)
-        
-        # Move optimizer state to correct device after loading
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
                          lr=lr, weight_decay=1e-4)
-        optimizer_state = checkpoint['optimizer_state_dict']
-        
-        # Ensure optimizer state tensors are on the correct device
-        for state in optimizer_state['state'].values():
-            for k, v in state.items():
-                if isinstance(v, torch.Tensor):
-                    state[k] = v.to(device)
-                    
-        optimizer.load_state_dict(optimizer_state)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         start_epoch = checkpoint['epoch'] + 1
         train_losses = checkpoint['train_losses']
@@ -939,24 +914,18 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        # Handle scaler state
         if 'scaler_state_dict' in checkpoint:
-            scaler_state = checkpoint['scaler_state_dict']
-            scaler.load_state_dict(scaler_state)
-        else:
-            scaler_state = None
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
         return (optimizer, scheduler, criterion, start_epoch, 
                 train_losses, val_losses, train_accuracies, 
                 val_accuracies, scaler)
     else:
-        
-
         initialize_weights(encoderunet)
-        initialize_encoder_specific(encoderunet.module.extencoder)
+        initialize_encoder_specific(encoderunet.extencoder)  # Remove .module
 
         initialize_weights(unetdecoder)
-        initialize_decoder_specific(unetdecoder.module.extdecoder)
+        initialize_decoder_specific(unetdecoder.extdecoder)  # Remove .module
 
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
                          lr=lr, weight_decay=1e-4)
