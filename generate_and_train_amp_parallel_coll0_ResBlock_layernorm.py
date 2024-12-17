@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader,Dataset,random_split,Subset
 #from torchvision import transforms
 #from torchsummary import summary
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
 
 from torch.optim import AdamW
 
@@ -920,7 +920,13 @@ def weighted_l1_loss(input, target, weights):
 
 
 def setup_training(encoderunet, unetdecoder, resume=0):
-    lr = 1e-5
+    base_lr = 1e-3  # Target learning rate after warm-up
+    warmup_epochs = 5  # Number of epochs for the warm-up phase
+    T_0 = 10  # Epochs for the first cosine restart
+    T_mult = 2  # Restart period multiplier
+    eta_min = 1e-4  # Minimum learning rate after decay
+    weight_decay = 1e-4
+
     criterion = nn.MSELoss().to(device)
     scaler = GradScaler()
     
@@ -951,8 +957,8 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         
         # Move optimizer state to correct device after loading
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                         lr=lr, weight_decay=1e-4)
-        optimizer_state = checkpoint['optimizer_state_dict']
+                          lr=base_lr, weight_decay=weight_decay)
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         
         # Ensure optimizer state tensors are on the correct device
         for state in optimizer_state['state'].values():
@@ -968,7 +974,10 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         train_accuracies = checkpoint['train_accuracies']
         val_accuracies = checkpoint['val_accuracies']
         
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-5)
+          # Scheduler with warm-up + cosine annealing restarts
+        scheduler = LambdaLR(
+            optimizer, lr_lambda=lambda epoch: lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult)
+        )
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
         # Handle scaler state
@@ -991,8 +1000,11 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         initialize_decoder_specific(unetdecoder.module.extdecoder)
 
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                         lr=lr, weight_decay=1e-4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-5)
+                          lr=base_lr, weight_decay=weight_decay)
+        # Scheduler with warm-up + cosine annealing restarts
+        scheduler = LambdaLR(
+            optimizer, lr_lambda=lambda epoch: lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult)
+        )
         start_epoch = 0
         train_losses = []
         val_losses = []
@@ -1002,6 +1014,31 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         return (optimizer, scheduler, criterion, start_epoch, 
                 train_losses, val_losses, train_accuracies, 
                 val_accuracies, scaler)
+    
+def lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult):
+    """
+    Combines warm-up with cosine annealing restarts.
+    - Warm-up: Gradually increases LR from a small value to base_lr.
+    - CosineAnnealingWarmRestarts: Periodically restarts LR using a cosine decay.
+    """
+    if epoch < warmup_epochs:
+        # Linear warm-up phase
+        return (epoch + 1) / warmup_epochs
+    else:
+        # Compute cosine annealing restart phase
+        cosine_epochs = epoch - warmup_epochs
+        T_cur = T_0
+        restart_count = 0
+
+        # Find the current restart cycle
+        while cosine_epochs >= T_cur:
+            cosine_epochs -= T_cur
+            T_cur *= T_mult
+            restart_count += 1
+
+        # Compute the learning rate scale for the current cycle
+        cosine_decay = 0.5 * (1 + torch.cos(torch.pi * cosine_epochs / T_cur))
+        return eta_min / base_lr + (1 - eta_min / base_lr) * cosine_decay
 
 
 # training_loop.py
@@ -1453,7 +1490,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         val_ds = Subset(Art_dataset, val_indices)
 
         # Adjust batch size based on available GPU memory
-        batch_size = 128// world_size  # Scale batch size by number of GPUs
+        batch_size = 256// world_size  # Scale batch size by number of GPUs
     
 
         train_loader = DataLoader(
@@ -1528,7 +1565,7 @@ if __name__ == "__main__":
     generate_flag = 0  # Set this flag to 1 if you want to generate datasets again
 
     # Launch training on 2 GPUs
-    world_size = 1
+    world_size = 2
     mp.spawn(
         train_ddp,
         args=(world_size, generate_flag, KM),
