@@ -516,33 +516,39 @@ class ExtEncoder(nn.Module):
         
         # Processing the vector inputs
         self.vector_fc = nn.Linear(vector_dim * 2, 512)
+        self.vector_norm = nn.LayerNorm(512)  # LayerNorm for vector processing
         
         # Processing the scalar inputs
         self.scalar_fc = nn.ModuleList([nn.Linear(1, 64) for _ in range(scalar_count)])
+        self.scalar_norms = nn.ModuleList([nn.LayerNorm(64) for _ in range(scalar_count)])  # LayerNorms for scalars
         
-        # Combined fully connected layer 
+        # Combined fully connected layer
         self.combined_fc = nn.Linear(512 + scalar_count * 64, latent_image_size ** 2 * 1)
-        
+        self.combined_norm = nn.LayerNorm(latent_image_size ** 2 * 1)  # LayerNorm for combined layer
+
     def forward(self, vector1, vector2, scalars):
         # Process the vectors
         vectors_combined = torch.cat((vector1.flatten(1), vector2.flatten(1)), dim=1)
-        vectors_encoded = F.relu(self.vector_fc(vectors_combined))
+        vectors_encoded = self.vector_fc(vectors_combined)
+        vectors_encoded = self.vector_norm(vectors_encoded)  # Apply LayerNorm
+        vectors_encoded = F.relu(vectors_encoded)
 
-        # Process each scalar individually
-        scalars_encoded = [F.relu(fc(scalar)) for fc, scalar in zip(self.scalar_fc, scalars.unbind(dim=2))]
+        # Process each scalar individually with LayerNorm
+        scalars_encoded = [
+            F.relu(norm(fc(scalar)))
+            for fc, norm, scalar in zip(self.scalar_fc, self.scalar_norms, scalars.unbind(dim=2))
+        ]
         scalars_encoded = torch.cat(scalars_encoded, dim=1)
 
         # Combine the processed vectors and scalars
         combined = torch.cat((vectors_encoded, scalars_encoded), dim=1)
         
-        # Apply combined fully connected layer
+        # Apply combined fully connected layer with LayerNorm
         combined_output = self.combined_fc(combined)
-
-        # Apply ReLU activation
+        combined_output = self.combined_norm(combined_output)  # Apply LayerNorm
         latent_image = torch.relu(combined_output)
-        
-        return latent_image.view(-1, 1, self.latent_image_size, self.latent_image_size)
 
+        return latent_image.view(-1, 1, self.latent_image_size, self.latent_image_size)
 
 class ResidualConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -656,21 +662,42 @@ class EncoderUNet(nn.Module):
 # This serves as output to the u-net
 
 
+
 class ExtDecoder(nn.Module):
     def __init__(self, vector_dim, scalar_count, latent_image_size):
         super(ExtDecoder, self).__init__()
-        self.fc = nn.Linear(latent_image_size ** 2, 512)  # Single channel
+        self.fc = nn.Linear(latent_image_size ** 2, 512)
+        self.fc_norm = nn.LayerNorm(512)  # LayerNorm for main FC layer
+        
         self.vector_fc1 = nn.Linear(512, vector_dim)
+        self.vector_fc1_norm = nn.LayerNorm(vector_dim)  # LayerNorm for vector_fc1
+        
         self.vector_fc2 = nn.Linear(512, vector_dim)
+        self.vector_fc2_norm = nn.LayerNorm(vector_dim)  # LayerNorm for vector_fc2
+        
         self.scalar_fc = nn.Linear(512, scalar_count)
+        self.scalar_norm = nn.LayerNorm(scalar_count)  # LayerNorm for scalar_fc
 
     def forward(self, latent_image):
+        # Flatten the latent image
         x = latent_image.view(latent_image.size(0), -1)
-        x = F.relu(self.fc(x))
         
+        # Process the main fully connected layer with LayerNorm
+        x = self.fc(x)
+        x = self.fc_norm(x)
+        x = F.relu(x)
+        
+        # Reconstruct the first vector
         reconstructed_vector1 = self.vector_fc1(x)
+        reconstructed_vector1 = self.vector_fc1_norm(reconstructed_vector1)
+        
+        # Reconstruct the second vector
         reconstructed_vector2 = self.vector_fc2(x)
+        reconstructed_vector2 = self.vector_fc2_norm(reconstructed_vector2)
+        
+        # Reconstruct the scalars
         reconstructed_scalars = self.scalar_fc(x)
+        reconstructed_scalars = self.scalar_norm(reconstructed_scalars)
         
         return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
 
@@ -893,13 +920,13 @@ def weighted_l1_loss(input, target, weights):
 
 
 def setup_training(encoderunet, unetdecoder, resume=0):
-    lr = 1e-4
+    lr = 1e-5
     criterion = nn.MSELoss().to(device)
     scaler = GradScaler()
     
     if resume == 1:
         # Load checkpoint
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_checkpoint.pth', 
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_layernorm_checkpoint.pth', 
                               map_location='cpu')
         
         # Handle state dict for DDP models
@@ -941,7 +968,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         train_accuracies = checkpoint['train_accuracies']
         val_accuracies = checkpoint['val_accuracies']
         
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-5)
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
         # Handle scaler state
@@ -965,7 +992,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
 
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
                          lr=lr, weight_decay=1e-4)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
+        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-5)
         start_epoch = 0
         train_losses = []
         val_losses = []
@@ -1353,7 +1380,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_layernorm_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1426,7 +1453,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         val_ds = Subset(Art_dataset, val_indices)
 
         # Adjust batch size based on available GPU memory
-        batch_size = 512// world_size  # Scale batch size by number of GPUs
+        batch_size = 128// world_size  # Scale batch size by number of GPUs
     
 
         train_loader = DataLoader(
@@ -1481,7 +1508,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=1)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
     
     if rank == 0:
         print("Training completed!")
@@ -1501,7 +1528,7 @@ if __name__ == "__main__":
     generate_flag = 0  # Set this flag to 1 if you want to generate datasets again
 
     # Launch training on 2 GPUs
-    world_size = 4
+    world_size = 1
     mp.spawn(
         train_ddp,
         args=(world_size, generate_flag, KM),
