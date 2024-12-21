@@ -516,39 +516,39 @@ class ExtEncoder(nn.Module):
         
         # Processing the vector inputs
         self.vector_fc = nn.Linear(vector_dim * 2, 512)
-        self.vector_norm = nn.LayerNorm(512)  # LayerNorm for vector processing
+        self.vector_norm = nn.LayerNorm(512)
         
         # Processing the scalar inputs
         self.scalar_fc = nn.ModuleList([nn.Linear(1, 64) for _ in range(scalar_count)])
-        self.scalar_norms = nn.ModuleList([nn.LayerNorm(64) for _ in range(scalar_count)])  # LayerNorms for scalars
+        self.scalar_norm = nn.LayerNorm(scalar_count * 64)
         
         # Combined fully connected layer
-        self.combined_fc = nn.Linear(512 + scalar_count * 64, latent_image_size ** 2 * 1)
-        self.combined_norm = nn.LayerNorm(latent_image_size ** 2 * 1)  # LayerNorm for combined layer
+        self.combined_fc = nn.Linear(512 + scalar_count * 64, latent_image_size ** 2)
+        self.combined_norm = nn.LayerNorm(latent_image_size ** 2)
 
     def forward(self, vector1, vector2, scalars):
         # Process the vectors
         vectors_combined = torch.cat((vector1.flatten(1), vector2.flatten(1)), dim=1)
         vectors_encoded = self.vector_fc(vectors_combined)
-        vectors_encoded = self.vector_norm(vectors_encoded)  # Apply LayerNorm
-        vectors_encoded = F.relu(vectors_encoded)
+        vectors_encoded = self.vector_norm(vectors_encoded)
+        vectors_encoded = F.relu(vectors_encoded)  # ReLU after norm
 
-        # Process each scalar individually with LayerNorm
-        scalars_encoded = [
-            F.relu(norm(fc(scalar)))
-            for fc, norm, scalar in zip(self.scalar_fc, self.scalar_norms, scalars.unbind(dim=2))
-        ]
+        # Process each scalar individually
+        scalars_encoded = []
+        for fc, scalar in zip(self.scalar_fc, scalars.unbind(dim=2)):
+            scalar_encoded = fc(scalar)
+            scalars_encoded.append(scalar_encoded)
         scalars_encoded = torch.cat(scalars_encoded, dim=1)
+        scalars_encoded = self.scalar_norm(scalars_encoded)
+        scalars_encoded = F.relu(scalars_encoded)  # ReLU after norm
 
         # Combine the processed vectors and scalars
         combined = torch.cat((vectors_encoded, scalars_encoded), dim=1)
-        
-        # Apply combined fully connected layer with LayerNorm
         combined_output = self.combined_fc(combined)
-        combined_output = self.combined_norm(combined_output)  # Apply LayerNorm
-        latent_image = torch.relu(combined_output)
+        combined_output = self.combined_norm(combined_output)
+        combined_output = F.relu(combined_output)  # ReLU after norm
 
-        return latent_image.view(-1, 1, self.latent_image_size, self.latent_image_size)
+        return combined_output.view(-1, 1, self.latent_image_size, self.latent_image_size)
 
 class ResidualConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -661,43 +661,29 @@ class EncoderUNet(nn.Module):
 # The decoder attempts to reconstruct the original scalar vectors and scalar values from the latent image.
 # This serves as output to the u-net
 
-
-
 class ExtDecoder(nn.Module):
     def __init__(self, vector_dim, scalar_count, latent_image_size):
         super(ExtDecoder, self).__init__()
         self.fc = nn.Linear(latent_image_size ** 2, 512)
-        self.fc_norm = nn.LayerNorm(512)  # LayerNorm for main FC layer
+        self.fc_norm = nn.LayerNorm(512)  # LayerNorm for the main FC layer
         
         self.vector_fc1 = nn.Linear(512, vector_dim)
-        self.vector_fc1_norm = nn.LayerNorm(vector_dim)  # LayerNorm for vector_fc1
-        
         self.vector_fc2 = nn.Linear(512, vector_dim)
-        self.vector_fc2_norm = nn.LayerNorm(vector_dim)  # LayerNorm for vector_fc2
-        
         self.scalar_fc = nn.Linear(512, scalar_count)
-        self.scalar_norm = nn.LayerNorm(scalar_count)  # LayerNorm for scalar_fc
 
     def forward(self, latent_image):
         # Flatten the latent image
         x = latent_image.view(latent_image.size(0), -1)
         
-        # Process the main fully connected layer with LayerNorm
+        # Main fully connected layer with LayerNorm and ReLU
         x = self.fc(x)
         x = self.fc_norm(x)
         x = F.relu(x)
         
-        # Reconstruct the first vector
+        # Reconstruct the vectors and scalars (no LayerNorm here)
         reconstructed_vector1 = self.vector_fc1(x)
-        reconstructed_vector1 = self.vector_fc1_norm(reconstructed_vector1)
-        
-        # Reconstruct the second vector
         reconstructed_vector2 = self.vector_fc2(x)
-        reconstructed_vector2 = self.vector_fc2_norm(reconstructed_vector2)
-        
-        # Reconstruct the scalars
         reconstructed_scalars = self.scalar_fc(x)
-        reconstructed_scalars = self.scalar_norm(reconstructed_scalars)
         
         return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
 
@@ -762,86 +748,99 @@ class UNetDecoder(nn.Module):
         x = self.unet2(frames)
         return self.extdecoder(x)
 
-    
-
 #### initalize weights #########################################################
-
 
 def initialize_weights(model):
     """
-    Optimized weight initialization for EncoderUNet and UNetDecoder architectures
+    Optimized weight initialization for all network components
     """
     for m in model.modules():
-        if isinstance(m, nn.Conv2d):
-            # Conv layers in UNet blocks - using He initialization for ReLU
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+        if isinstance(m, ResidualConvBlock):
+            initialize_residual_block(m)
+        elif isinstance(m, nn.Conv2d):
+            if m.kernel_size == (1, 1):  # Shortcut connections
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
+            else:  # Regular conv layers
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0.01)
+                nn.init.constant_(m.bias, 0)
                 
         elif isinstance(m, nn.ConvTranspose2d):
-            # Transposed conv layers in decoder blocks
             nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
             if m.bias is not None:
-                nn.init.constant_(m.bias, 0.01)
+                nn.init.constant_(m.bias, 0)
                 
         elif isinstance(m, nn.Linear):
-            if m.in_features == 104 * 2:  # vector_fc in ExtEncoder
-                # Special initialization for processing input vectors
-                nn.init.xavier_uniform_(m.weight)
-                nn.init.constant_(m.bias, 0)
-            elif m.out_features == 512:  # fc in ExtDecoder
-                # Initialization for feature extraction
-                nn.init.xavier_uniform_(m.weight, gain=1.414)
-                nn.init.constant_(m.bias, 0)
-            else:  # Other linear layers
-                # Scale based on input size for better gradient flow
-                bound = 1 / math.sqrt(m.in_features)
-                nn.init.uniform_(m.weight, -bound, bound)
-                if m.bias is not None:
-                    nn.init.uniform_(m.bias, -bound, bound)
+            # Check if it's an output layer (no ReLU follows)
+            is_output_layer = True
+            for child in m._forward_hooks.values():
+                if isinstance(child, (nn.ReLU, nn.LeakyReLU)):
+                    is_output_layer = False
+                    break
                     
-        elif isinstance(m, nn.BatchNorm2d):
-            # Standard initialization for batch norm
-            nn.init.constant_(m.weight, 1)
+            if is_output_layer:
+                nn.init.kaiming_normal_(m.weight, mode='fan_in', nonlinearity='linear')
+                nn.init.uniform_(m.bias, -0.1, 0.1)  # Small non-zero bias for output layers
+            else:
+                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
+                nn.init.constant_(m.bias, 0)
+                    
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.constant_(m.weight, 1.0)
             nn.init.constant_(m.bias, 0)
-            
-        elif isinstance(m, nn.MaxPool2d):
-            # MaxPool doesn't have parameters but included for completeness
-            pass
 
 def initialize_encoder_specific(encoder):
     """
     Specific initialization for ExtEncoder
     """
-    # Initialize vector processing layers
-    nn.init.xavier_uniform_(encoder.vector_fc.weight)
+    # Vector processing 
+    nn.init.kaiming_normal_(encoder.vector_fc.weight, mode='fan_out', nonlinearity='relu')
     nn.init.constant_(encoder.vector_fc.bias, 0)
+    nn.init.constant_(encoder.vector_norm.weight, 1.0)
+    nn.init.constant_(encoder.vector_norm.bias, 0)
     
-    # Initialize scalar processing layers
+    # Scalar processing 
     for fc in encoder.scalar_fc:
-        nn.init.xavier_uniform_(fc.weight)
+        nn.init.kaiming_normal_(fc.weight, mode='fan_out', nonlinearity='relu')
         nn.init.constant_(fc.bias, 0)
+    nn.init.constant_(encoder.scalar_norm.weight, 1.0)
+    nn.init.constant_(encoder.scalar_norm.bias, 0)
     
-    # Initialize combined layer with careful scaling
-    nn.init.xavier_uniform_(encoder.combined_fc.weight, gain=1.414)
-    nn.init.constant_(encoder.combined_fc.bias, 0.01)
+    # Combined processing 
+    nn.init.kaiming_normal_(encoder.combined_fc.weight, mode='fan_out', nonlinearity='relu')
+    nn.init.constant_(encoder.combined_fc.bias, 0)
+    nn.init.constant_(encoder.combined_norm.weight, 1.0)
+    nn.init.constant_(encoder.combined_norm.bias, 0)
 
 def initialize_decoder_specific(decoder):
     """
     Specific initialization for ExtDecoder
     """
-    # Initialize main feature extraction
-    nn.init.xavier_uniform_(decoder.fc.weight, gain=1.414)
+    # Feature extraction 
+    nn.init.kaiming_normal_(decoder.fc.weight, mode='fan_out', nonlinearity='relu')
     nn.init.constant_(decoder.fc.bias, 0)
+    nn.init.constant_(decoder.fc_norm.weight, 1.0)
+    nn.init.constant_(decoder.fc_norm.bias, 0)
     
-    # Initialize vector reconstruction layers
-    for fc in [decoder.vector_fc1, decoder.vector_fc2]:
-        nn.init.xavier_uniform_(fc.weight)
-        nn.init.constant_(fc.bias, 0)
+
+    for fc in [decoder.vector_fc1, decoder.vector_fc2, decoder.scalar_fc]:
+        nn.init.kaiming_normal_(fc.weight, mode='fan_in', nonlinearity='linear')
+        nn.init.uniform_(fc.bias, -0.1, 0.1)
+
+def initialize_residual_block(block):
+    """
+    Specific initialization for ResidualConvBlock
+    """
+    # Main convolution path
+    nn.init.kaiming_normal_(block.conv1.weight, mode='fan_out', nonlinearity='relu')
+    nn.init.constant_(block.conv1.bias, 0)
+    nn.init.kaiming_normal_(block.conv2.weight, mode='fan_in', nonlinearity='linear')
+    nn.init.constant_(block.conv2.bias, 0)
     
-    # Initialize scalar reconstruction
-    nn.init.xavier_uniform_(decoder.scalar_fc.weight)
-    nn.init.constant_(decoder.scalar_fc.bias, 0)
+    # Shortcut connection
+    if isinstance(block.shortcut, nn.Conv2d):
+        nn.init.kaiming_normal_(block.shortcut.weight, mode='fan_in', nonlinearity='linear')
+        nn.init.constant_(block.shortcut.bias, 0)
 
     
 # training_utils.py########################################################
@@ -920,11 +919,11 @@ def weighted_l1_loss(input, target, weights):
 
 
 def setup_training(encoderunet, unetdecoder, resume=0):
-    base_lr = 1e-3  # Target learning rate after warm-up
+    base_lr = 5e-5  # Target learning rate after warm-up
     warmup_epochs = 5  # Number of epochs for the warm-up phase
     T_0 = 10  # Epochs for the first cosine restart
     T_mult = 2  # Restart period multiplier
-    eta_min = 1e-4  # Minimum learning rate after decay
+    eta_min = 1e-5  # Minimum learning rate after decay
     weight_decay = 1e-4
 
     criterion = nn.MSELoss().to(device)
@@ -955,18 +954,21 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         encoderunet.load_state_dict(encoderunet_state)
         unetdecoder.load_state_dict(unetdecoder_state)
         
-        # Move optimizer state to correct device after loading
+        # Create optimizer first
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                          lr=base_lr, weight_decay=weight_decay)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                         lr=base_lr, weight_decay=weight_decay)
         
-        # Ensure optimizer state tensors are on the correct device
-        for state in optimizer_state['state'].values():
+        # Load optimizer state dict
+        optimizer_state_dict = checkpoint['optimizer_state_dict']
+        
+        # Move optimizer state to correct device
+        for state in optimizer_state_dict['state'].values():
             for k, v in state.items():
                 if isinstance(v, torch.Tensor):
                     state[k] = v.to(device)
-                    
-        optimizer.load_state_dict(optimizer_state)
+        
+        # Load the processed optimizer state
+        optimizer.load_state_dict(optimizer_state_dict)
         
         start_epoch = checkpoint['epoch'] + 1
         train_losses = checkpoint['train_losses']
@@ -974,7 +976,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         train_accuracies = checkpoint['train_accuracies']
         val_accuracies = checkpoint['val_accuracies']
         
-          # Scheduler with warm-up + cosine annealing restarts
+        # Scheduler with warm-up + cosine annealing restarts
         scheduler = LambdaLR(
             optimizer, lr_lambda=lambda epoch: lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult)
         )
@@ -982,25 +984,22 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         
         # Handle scaler state
         if 'scaler_state_dict' in checkpoint:
-            scaler_state = checkpoint['scaler_state_dict']
-            scaler.load_state_dict(scaler_state)
-        else:
-            scaler_state = None
+            scaler.load_state_dict(checkpoint['scaler_state_dict'])
             
         return (optimizer, scheduler, criterion, start_epoch, 
                 train_losses, val_losses, train_accuracies, 
                 val_accuracies, scaler)
     else:
-        
-
+        # For encoder
         initialize_weights(encoderunet)
         initialize_encoder_specific(encoderunet.module.extencoder)
 
+        # For decoder
         initialize_weights(unetdecoder)
         initialize_decoder_specific(unetdecoder.module.extdecoder)
 
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                          lr=base_lr, weight_decay=weight_decay)
+                         lr=base_lr, weight_decay=weight_decay)
         # Scheduler with warm-up + cosine annealing restarts
         scheduler = LambdaLR(
             optimizer, lr_lambda=lambda epoch: lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult)
@@ -1014,7 +1013,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         return (optimizer, scheduler, criterion, start_epoch, 
                 train_losses, val_losses, train_accuracies, 
                 val_accuracies, scaler)
-    
+
 def lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult):
     """
     Combines warm-up with cosine annealing restarts.
@@ -1036,9 +1035,11 @@ def lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult):
             T_cur *= T_mult
             restart_count += 1
 
+        # Convert to tensor for cosine calculation
+        cosine_input = torch.tensor(cosine_epochs / T_cur * math.pi)
         # Compute the learning rate scale for the current cycle
-        cosine_decay = 0.5 * (1 + torch.cos(torch.pi * cosine_epochs / T_cur))
-        return eta_min / base_lr + (1 - eta_min / base_lr) * cosine_decay
+        cosine_decay = 0.5 * (1 + torch.cos(cosine_input))
+        return eta_min / base_lr + (1 - eta_min / base_lr) * cosine_decay.item()
 
 
 # training_loop.py
@@ -1353,7 +1354,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
         #val_accuracies.append(average_val_accuracy)
         
         # Step scheduler
-        scheduler.step(epoch)
+        scheduler.step()
         current_lr = optimizer.param_groups[0]['lr']
         
         # Calculate elapsed time

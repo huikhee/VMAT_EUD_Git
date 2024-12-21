@@ -3,11 +3,11 @@
 # same as used for furst paper submission
 #now adapted for VMAT
 import sys
-
+import math
 
 import numpy as np
 import time
-from datetime import datetime
+from datetime import timedelta
 
 import torch
 import torch.nn as nn
@@ -19,7 +19,7 @@ import torch.nn.functional as F
 from torch.utils.data import DataLoader,Dataset,random_split,Subset
 #from torchvision import transforms
 #from torchsummary import summary
-from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts
+from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
 
 from torch.optim import AdamW
 
@@ -41,13 +41,14 @@ import pandas as pd
 import matplotlib.pyplot as plt
 
 import os
+import socket
 
 from torch.cuda.amp import autocast, GradScaler
 
-import cProfile
-import pstats
-from datetime import datetime
-import torch.autograd.profiler as profiler
+import torch.distributed as dist
+import torch.multiprocessing as mp
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 has_gpu = torch.cuda.is_available()
 has_mps = torch.backends.mps.is_built()
@@ -73,7 +74,7 @@ def generate_random_vectors_scalar_regular(seed):
     """Generate random vectors and scalars with regular pattern."""
     np.random.seed(seed)
     
-    num_samples = 2000
+    num_samples = 2048
     vector_length = 52
 
     # Initialize arrays
@@ -138,7 +139,7 @@ def generate_random_vectors_scalar_semiregular(seed):
     """Generate random vectors and scalars with semi-regular pattern."""
     np.random.seed(seed)
     
-    num_samples = 2000
+    num_samples = 2048
     vector_length = 52
 
     scalar1 = np.zeros(num_samples)
@@ -214,7 +215,7 @@ def generate_random_vectors_scalars(seed):
     """Generate random vectors and scalars for VMAT data."""
     np.random.seed(seed)
     
-    num_samples = 2000
+    num_samples = 2048
     vector_length = 52
 
     # Initialize arrays
@@ -332,8 +333,9 @@ def create_boundary_matrix(vector1, vector2, scalar1, scalar2, scalar3):
         
         # Rotate matrix
         matrix = np.flipud(matrix)
-        rotated_matrix = scipy.ndimage.rotate(matrix, 45, reshape=False, mode='constant', cval=0.0)
+        rotated_matrix = scipy.ndimage.rotate(matrix, 0, reshape=False, mode='constant', cval=0.0)
         matrix_collection.append(rotated_matrix)
+
 
     return matrix_collection
 
@@ -407,12 +409,12 @@ class CustomDataset(Dataset):
 def save_dataset(dataset, dataset_num):
     """Function to save dataset"""
     os.makedirs("VMAT_Art_data", exist_ok=True)
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll45_{dataset_num}.pt")
+    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
     torch.save(dataset, filename)
 
 def load_dataset(dataset_num):
     """Function to load dataset"""
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll45_{dataset_num}.pt")
+    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
     if os.path.exists(filename):
         try:
             return torch.load(filename)
@@ -421,18 +423,21 @@ def load_dataset(dataset_num):
             return None
     return None
 
-def generate_and_save_dataset(dataset_num):
+def generate_and_save_dataset(dataset_num, KM):
     """Generate and save a complete dataset."""
     # Choose the appropriate vector generation function based on dataset number
     if 0 <= dataset_num <= 79:
-        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = \
-            generate_random_vectors_scalar_regular(42 + dataset_num)
+        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = generate_random_vectors_scalar_regular(42 + dataset_num)
     elif 80 <= dataset_num <= 159:
-        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = \
-            generate_random_vectors_scalar_semiregular(42 + dataset_num)
+        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = generate_random_vectors_scalar_semiregular(42 + dataset_num)
+    elif 160 <= dataset_num <= 319:
+        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = generate_random_vectors_scalars(42 + dataset_num)
+    elif 320 <= dataset_num <= 399:
+        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = generate_random_vectors_scalar_regular(42 + dataset_num)
+    elif 400 <= dataset_num <= 479:
+        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = generate_random_vectors_scalar_semiregular(42 + dataset_num)
     else:
-        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = \
-            generate_random_vectors_scalars(42 + dataset_num)
+        vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = generate_random_vectors_scalars(43 + dataset_num)
 
     num_samples = len(vector1)
     num_interpolations = 5
@@ -498,187 +503,395 @@ def generate_and_save_dataset(dataset_num):
 
 # models.py
 
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
+# embedded EncoderUnet model
 
-class ExtEncoder(nn.Module):
-    def __init__(self, vector_dim, scalar_count, latent_image_size):
-        super(ExtEncoder, self).__init__()
-        self.vector_fc = nn.Linear(vector_dim * 2, 512)
-        self.scalar_fc = nn.ModuleList([nn.Linear(1, 64) for _ in range(scalar_count)])
-        self.combined_fc = nn.Linear(512 + scalar_count * 64, latent_image_size ** 2 * 1)
-        self.latent_image_size = latent_image_size
+# -------------------------------------------------------------------------
+# ResidualConvBlock
+# -------------------------------------------------------------------------
+class ResidualConvBlock(nn.Module):
+    """
+    A 2D residual block with:
+      - two conv layers (3x3)
+      - GroupNorm(1, C) after each conv
+      - ReLU activation
+      - optional shortcut if in_channels != out_channels
+    This matches your updated version that uses GroupNorm to emulate LayerNorm behavior in CNNs.
+    """
+    def __init__(self, in_channels, out_channels):
+        super(ResidualConvBlock, self).__init__()
         
-    def forward(self, vector1, vector2, scalars):
-        # Process vectors
-        vectors_combined = torch.cat((vector1.flatten(1), vector2.flatten(1)), dim=1)
-        vectors_encoded = F.relu(self.vector_fc(vectors_combined))
+        # First convolution (3x3), groupnorm, ReLU
+        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1, bias=True)
+        self.norm1 = nn.GroupNorm(1, out_channels)
+        self.relu = nn.ReLU(inplace=True)
         
-        # Process scalars
-        scalars = scalars.squeeze(1)  # Remove the extra dimension
-        scalars_encoded = []
-        for i, fc in enumerate(self.scalar_fc):
-            scalar = scalars[:, i].unsqueeze(1)  # Get i-th scalar and add dimension for Linear layer
-            scalar_encoded = F.relu(fc(scalar))
-            scalars_encoded.append(scalar_encoded)
+        # Second convolution (3x3), groupnorm
+        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1, bias=True)
+        self.norm2 = nn.GroupNorm(1, out_channels)
         
-        # Combine all encoded features
-        scalars_encoded = torch.cat(scalars_encoded, dim=1)
-        combined = torch.cat((vectors_encoded, scalars_encoded), dim=1)
-        
-        # Final processing
-        latent_image = F.relu(self.combined_fc(combined))
-        return latent_image.view(-1, 1, self.latent_image_size, self.latent_image_size)
+        # Shortcut / identity mapping
+        # If in/out channels differ, use a 1x1 conv; otherwise do nothing.
+        if in_channels != out_channels:
+            self.shortcut = nn.Conv2d(in_channels, out_channels, kernel_size=1, bias=True)
+        else:
+            self.shortcut = nn.Identity()
 
-class ExtDecoder(nn.Module):
-    def __init__(self, vector_dim, scalar_count, latent_image_size):
-        super(ExtDecoder, self).__init__()
-        self.conv1 = nn.Conv2d(1, 64, 3, padding=1)
-        self.conv2 = nn.Conv2d(64, 32, 3, padding=1)
-        self.conv3 = nn.Conv2d(32, 16, 3, padding=1)
-        self.conv4 = nn.Conv2d(16, 1, 3, padding=1)
-        self.fc1 = nn.Linear(latent_image_size ** 2, 512)
-        self.vector_fc = nn.Linear(512, vector_dim * 2)
-        self.scalar_fc = nn.Linear(512, scalar_count)
-        
     def forward(self, x):
-        x = F.relu(self.conv1(x))
-        x = F.relu(self.conv2(x))
-        x = F.relu(self.conv3(x))
-        x = F.relu(self.conv4(x))
-        x = x.flatten(1)
-        x = F.relu(self.fc1(x))
-        vectors = self.vector_fc(x)
-        scalars = self.scalar_fc(x)
-        vector1, vector2 = torch.split(vectors, vectors.size(1)//2, dim=1)
-        return vector1, vector2, scalars
+        """
+        Forward pass:
+          1) Apply conv1 + norm1 + ReLU
+          2) Apply conv2 + norm2
+          3) Add the original 'x' (optionally projected) to the result
+          4) ReLU again
+        """
+        identity = self.shortcut(x)  # Might be 1x1 conv if channels differ
 
+        out = self.conv1(x)
+        out = self.norm1(out)
+        out = self.relu(out)
+        
+        out = self.conv2(out)
+        out = self.norm2(out)
+        
+        out += identity
+        out = self.relu(out)
+        return out
+
+
+# -------------------------------------------------------------------------
+# EncoderBlock
+# -------------------------------------------------------------------------
+class EncoderBlock(nn.Module):
+    """
+    A UNet encoder block:
+      1) A ResidualConvBlock for feature extraction
+      2) A MaxPool2d for spatial downsampling
+    """
+    def __init__(self, in_channels, out_channels):
+        super(EncoderBlock, self).__init__()
+        
+        # A residual conv block to learn features
+        self.conv_block = ResidualConvBlock(in_channels, out_channels)
+        # 2x2 pooling to halve spatial dimensions
+        self.pool = nn.MaxPool2d(kernel_size=2, stride=2)
+
+    def forward(self, x):
+        """
+        Returns:
+          f:  feature map after the conv block
+          p:  pooled feature map for the next encoding stage
+        """
+        f = self.conv_block(x)  # (B, out_channels, H, W)
+        p = self.pool(f)        # (B, out_channels, H/2, W/2)
+        return f, p
+
+
+# -------------------------------------------------------------------------
+# DecoderBlock
+# -------------------------------------------------------------------------
+class DecoderBlock(nn.Module):
+    """
+    A UNet decoder block:
+      1) ConvTranspose2d for upsampling
+      2) Concatenate with skip features
+      3) ResidualConvBlock to combine them
+    """
+    def __init__(self, in_channels, out_channels):
+        super(DecoderBlock, self).__init__()
+        
+        # 2x upsampling via transposed convolution
+        self.conv_transpose = nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2)
+        
+        # After concatenation, the channel dimension is out_channels + skip_channels (= out_channels).
+        # But "skip_channels" = out_channels in this standard pattern, so total is (out_channels * 2).
+        self.conv_block = ResidualConvBlock(out_channels * 2, out_channels)
+
+    def forward(self, x, skip_features):
+        """
+        Args:
+          x: upsampled feature map
+          skip_features: feature map from the encoder
+        Returns:
+          A combined feature map after upsampling, concatenation, and residual conv block.
+        """
+        x = self.conv_transpose(x)                   # (B, out_channels, 2H, 2W)
+        x = torch.cat((x, skip_features), dim=1)     # (B, out_channels*2, 2H, 2W)
+        x = self.conv_block(x)
+        return x
+
+
+# -------------------------------------------------------------------------
+# EncoderUNet
+# -------------------------------------------------------------------------
 class EncoderUNet(nn.Module):
-    def __init__(self, ExtEncoder, vector_dim, scalar_count, latent_image_size, 
-                 in_channels, out_channels, resize_out, freeze_encoder=False):
+    """
+    The 'EncoderUNet' takes in vectors & scalars, embeds them into a 1x64x64 "latent image,"
+    and passes that through a UNet to produce a (single-channel) 131x131 output.
+
+    This final model includes:
+      1) Vector & scalar embedding
+      2) Reshaping to 1x64x64
+      3) UNet encoder: 3 levels of downsampling
+      4) Bottleneck
+      5) UNet decoder: 3 levels of upsampling
+      6) Extra 2D conv upsample from 64x64 to 128x128
+      7) Final bilinear resize to 131x131
+    """
+    def __init__(self, vector_dim, scalar_count):
         super(EncoderUNet, self).__init__()
-        self.encoder = ExtEncoder(vector_dim, scalar_count, latent_image_size)
-        self.resize_out = resize_out
         
-        # U-Net components
-        self.inc = DoubleConv(in_channels, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512)
-        self.down4 = Down(512, 512)
-        self.up1 = Up(1024, 256)
-        self.up2 = Up(512, 128)
-        self.up3 = Up(256, 64)
-        self.up4 = Up(128, 64)
-        self.outc = OutConv(64, out_channels)
+        # A single ReLU instance for embedding layers
+        self.relu = nn.ReLU(inplace=True)
         
-        if freeze_encoder:
-            for param in self.encoder.parameters():
-                param.requires_grad = False
-                
+        # -----------------------------------------------------------------
+        # 1) Vector and scalar embeddings
+        #    - vector_fc merges vector1 & vector2 into 128 dims
+        #    - scalar_fc merges scalar inputs into 64 dims
+        # -----------------------------------------------------------------
+        self.vector_fc = nn.Linear(vector_dim * 2, 128)
+        self.scalar_fc = nn.Linear(scalar_count, 64)
+        
+        # -----------------------------------------------------------------
+        # 2) Convert combined 128 + 64 = 192 dims into a 64x64 "latent image"
+        #    That means 1 * 64 * 64 = 4096
+        # -----------------------------------------------------------------
+        self.latent_to_image = nn.Linear(128 + 64, 64 * 64)
+        
+        # -----------------------------------------------------------------
+        # 3) UNet encoder blocks
+        #    Each encoder block returns (features, pooled_features)
+        # -----------------------------------------------------------------
+        self.encoder1 = EncoderBlock(in_channels=1,  out_channels=32)   # 64x64 -> 32x32
+        self.encoder2 = EncoderBlock(in_channels=32, out_channels=64)   # 32x32 -> 16x16
+        self.encoder3 = EncoderBlock(in_channels=64, out_channels=128)  # 16x16 -> 8x8
+        
+        # Bottleneck: a single ResidualConvBlock
+        self.bottleneck = ResidualConvBlock(in_channels=128, out_channels=256)  # 8x8 stays 8x8
+        
+        # -----------------------------------------------------------------
+        # 4) UNet decoder blocks
+        #    Each decoder block upsamples + merges skip connections
+        # -----------------------------------------------------------------
+        self.decoder3 = DecoderBlock(in_channels=256, out_channels=128) # 8x8 -> 16x16
+        self.decoder2 = DecoderBlock(in_channels=128, out_channels=64)  # 16x16 -> 32x32
+        self.decoder1 = DecoderBlock(in_channels=64,  out_channels=32)  # 32x32 -> 64x64
+        
+        # -----------------------------------------------------------------
+        # 5) Additional upsampling to reach 128x128
+        #    (64x64 -> 128x128)
+        # -----------------------------------------------------------------
+        self.up1 = nn.ConvTranspose2d(in_channels=32, out_channels=16,
+                                      kernel_size=3, stride=2, 
+                                      padding=1, output_padding=1)
+        
+        # Final convolution from 16 channels -> 1 channel
+        self.final_conv = nn.Conv2d(in_channels=16, out_channels=1, kernel_size=3, padding=1)
+        
+        # -----------------------------------------------------------------
+        # 6) Final bilinear resize from 128x128 to 131x131
+        # -----------------------------------------------------------------
+        self.final_resize = nn.Upsample(size=(131, 131), mode='bilinear', align_corners=False)
+        
+
     def forward(self, vector1, vector2, scalars):
-        x = self.encoder(vector1, vector2, scalars)
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        if self.resize_out != logits.size(-1):
-            logits = F.interpolate(logits, size=(self.resize_out, self.resize_out), 
-                                 mode='bilinear', align_corners=True)
-        return logits
+        """
+        Args:
+          vector1: (B, vector_dim)
+          vector2: (B, vector_dim)
+          scalars: (B, scalar_count)
 
-class UNetDecoder(nn.Module):
-    def __init__(self, ExtDecoder, vector_dim, scalar_count, latent_image_size, 
-                 in_channels, out_channels, resize_in, freeze_encoder=False):
-        super(UNetDecoder, self).__init__()
-        self.decoder = ExtDecoder(vector_dim, scalar_count, latent_image_size)
-        self.resize_in = resize_in
+        Returns:
+          output_image: (B, 1, 131, 131) final single-channel image
+        """
+        # -----------------------------------------------------------------
+        # Embed vectors and scalars -> combine -> reshape to 1x64x64
+        # -----------------------------------------------------------------
+        # Merge vector1 & vector2: shape (B, 2 * vector_dim)
+        vec_input = torch.cat([vector1, vector2], dim=1)
+        vec_features = self.relu(self.vector_fc(vec_input))  # (B, 128)
         
-        # U-Net components
-        self.inc = DoubleConv(in_channels, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 512)
-        self.down4 = Down(512, 512)
-        self.up1 = Up(1024, 256)
-        self.up2 = Up(512, 128)
-        self.up3 = Up(256, 64)
-        self.up4 = Up(128, 64)
-        self.outc = OutConv(64, out_channels)
+        # Scalar embedding: shape (B, scalar_count)
+        scalar_features = self.relu(self.scalar_fc(scalars)) # (B, 64)
         
-        if freeze_encoder:
-            for param in self.decoder.parameters():
-                param.requires_grad = False
-                
+        # Concatenate all embedded features => (B, 128 + 64 = 192)
+        latent = torch.cat([vec_features, scalar_features], dim=1)
+        
+        # Convert to a 1×64×64 "image"
+        latent_image = self.latent_to_image(latent).view(-1, 1, 64, 64)
+        
+        # -----------------------------------------------------------------
+        # Pass through UNet encoder
+        #   - Each encoder block returns (f, p) 
+        #   - f is the feature map, p is the pooled map
+        # -----------------------------------------------------------------
+        f1, p1 = self.encoder1(latent_image)   # 64x64 -> 32x32
+        f2, p2 = self.encoder2(p1)             # 32x32 -> 16x16
+        f3, p3 = self.encoder3(p2)             # 16x16 -> 8x8
+        
+        # Bottleneck
+        bottleneck = self.bottleneck(p3)       # 8x8
+        
+        # -----------------------------------------------------------------
+        # UNet decoder (no extra + skip_features outside):
+        #   - upsample + skip concat inside each decoder block
+        # -----------------------------------------------------------------
+        u3 = self.decoder3(bottleneck, f3)  # 8x8 -> 16x16
+        u2 = self.decoder2(u3, f2)          # 16x16 -> 32x32
+        u1 = self.decoder1(u2, f1)          # 32x32 -> 64x64
+        
+        # -----------------------------------------------------------------
+        # Additional upsampling: from 64x64 to 128x128
+        # -----------------------------------------------------------------
+        up1 = self.up1(u1)  # (B, 16, 128, 128)
+        up1 = self.relu(up1)
+        
+        # Final convolution from 16->1
+        output_image = self.final_conv(up1)  # (B, 1, 128, 128)
+        output_image = self.relu(output_image)
+        
+        # -----------------------------------------------------------------
+        # Final resize: from 128x128 -> 131x131
+        # -----------------------------------------------------------------
+        output_image = self.final_resize(output_image)
+        
+        return output_image
+
+###############################################################
+# embedded UnetDecoder model
+
+class DecoderUNet(nn.Module):
+    """
+    Takes a 2-channel 131x131 image and:
+      1) Two-step downsample to 64x64:
+         (a) 131->128 by bilinear up/downsampling
+         (b) 128->64 by MaxPool2d
+      2) Pass through a UNet (3 encoder levels + bottleneck + 3 decoder levels)
+      3) Squeeze channels to 1 (1x64x64)
+      4) Flatten and produce reconstructed vectors/scalars
+    """
+    def __init__(self, vector_dim, scalar_count):
+        super(DecoderUNet, self).__init__()
+        
+        # ReLU for consistency
+        self.relu = nn.ReLU(inplace=True)
+        
+        # --------------------
+        # Step 1: 131 -> 128 (non-trainable bilinear interpolation)
+        # Step 2: 128 -> 64  (MaxPool2d, standard downsampling)
+        # --------------------
+        self.downsample_to_128 = nn.Upsample(size=(128, 128), mode='bilinear', align_corners=False)
+        self.downsample_128_to_64 = nn.MaxPool2d(kernel_size=2, stride=2)
+        
+        # --------------------
+        # UNet Encoder
+        # --------------------
+        self.encoder1 = EncoderBlock(in_channels=2,  out_channels=32)   # 64x64 -> 32x32
+        self.encoder2 = EncoderBlock(in_channels=32, out_channels=64)   # 32x32 -> 16x16
+        self.encoder3 = EncoderBlock(in_channels=64, out_channels=128)  # 16x16 -> 8x8
+        
+        # Bottleneck
+        self.bottleneck = ResidualConvBlock(in_channels=128, out_channels=256)  # 8x8 (no change in spatial)
+        
+        # --------------------
+        # UNet Decoder
+        # --------------------
+        self.decoder3 = DecoderBlock(in_channels=256, out_channels=128) # 8x8  -> 16x16
+        self.decoder2 = DecoderBlock(in_channels=128, out_channels=64)  # 16x16 -> 32x32
+        self.decoder1 = DecoderBlock(in_channels=64,  out_channels=32)  # 32x32 -> 64x64
+        
+        # --------------------
+        # Final conv to get single latent channel
+        # --------------------
+        self.final_conv = nn.Conv2d(32, 1, kernel_size=3, padding=1)
+        
+        # --------------------
+        # Flatten + FC layers
+        # --------------------
+        # Flatten from (1,64,64) => 4096
+        self.fc_main = nn.Linear(64 * 64, 512)
+        self.fc_norm = nn.LayerNorm(512)
+        
+        self.vector_fc1 = nn.Linear(512, vector_dim)
+        self.vector_fc2 = nn.Linear(512, vector_dim)
+        self.scalar_fc  = nn.Linear(512, scalar_count)
+
     def forward(self, x):
-        if x.size(-1) != self.resize_in:
-            x = F.interpolate(x, size=(self.resize_in, self.resize_in), 
-                            mode='bilinear', align_corners=True)
-        x1 = self.inc(x)
-        x2 = self.down1(x1)
-        x3 = self.down2(x2)
-        x4 = self.down3(x3)
-        x5 = self.down4(x4)
-        x = self.up1(x5, x4)
-        x = self.up2(x, x3)
-        x = self.up3(x, x2)
-        x = self.up4(x, x1)
-        logits = self.outc(x)
-        vector1, vector2, scalars = self.decoder(logits)
-        return vector1, vector2, scalars
+        """
+        x: (batch_size, 2, 131, 131) input image
+        Returns:
+            reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
+        """
+        # --------------------
+        # Two-step downsampling
+        # --------------------
+        x = self.downsample_to_128(x)       # (B, 2, 128, 128)
+        x = self.downsample_128_to_64(x)    # (B, 2, 64, 64)
 
-# U-Net helper components
-class DoubleConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.double_conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
+        # --------------------
+        # UNet Encoder
+        # --------------------
+        f1, p1 = self.encoder1(x)   # (B, 32, 32, 32)
+        f2, p2 = self.encoder2(p1)  # (B, 64, 16, 16)
+        f3, p3 = self.encoder3(p2)  # (B, 128, 8, 8)
+        
+        # Bottleneck
+        btl = self.bottleneck(p3)   # (B, 256, 8, 8)
+        
+        # --------------------
+        # UNet Decoder
+        # --------------------
+        u3 = self.decoder3(btl, f3) # (B, 128, 16, 16)
+        u2 = self.decoder2(u3, f2)  # (B, 64,  32, 32)
+        u1 = self.decoder1(u2, f1)  # (B, 32,  64, 64)
+        
+        # --------------------
+        # Final conv to single channel
+        # --------------------
+        out = self.final_conv(u1)   # (B, 1, 64, 64)
+        out = self.relu(out)        # ReLU activation
 
-    def forward(self, x):
-        return self.double_conv(x)
+        # --------------------
+        # Flatten and feed into FC layers
+        # --------------------
+        out = out.view(out.size(0), -1)  # (B, 4096)
+        
+        # Main FC
+        out = self.fc_main(out)     # (B, 512)
+        out = self.fc_norm(out)
+        out = self.relu(out)
+        
+        # Separate heads for reconstructed vectors & scalars
+        reconstructed_vector1 = self.vector_fc1(out)
+        reconstructed_vector2 = self.vector_fc2(out)
+        reconstructed_scalars = self.scalar_fc(out)
+        
+        return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
 
-class Down(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.maxpool_conv = nn.Sequential(
-            nn.MaxPool2d(2),
-            DoubleConv(in_channels, out_channels)
-        )
+#### initalize weights #########################################################
 
-    def forward(self, x):
-        return self.maxpool_conv(x)
+def initialize_weights(model):
+     """
+    Initialize the weights of layers in a neural network, using typical best practices.
+    """
+    if isinstance(m, (nn.Conv2d, nn.ConvTranspose2d)):
+        # Kaiming (He) normal initialization for convolutional layers
+        nn.init.kaiming_normal_(m.weight, a=0, mode='fan_in', nonlinearity='relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+            
+    elif isinstance(m, nn.Linear):
+        # Xavier (Glorot) uniform initialization for fully-connected layers
+        nn.init.xavier_uniform_(m.weight)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
+            
+    elif isinstance(m, (nn.BatchNorm2d, nn.GroupNorm, nn.LayerNorm)):
+        # For (Group/Batch/Layer)Norm: weight=1, bias=0 is common
+        if m.weight is not None:
+            nn.init.constant_(m.weight, 1)
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0)
 
-class Up(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        self.up = nn.ConvTranspose2d(in_channels // 2, in_channels // 2, kernel_size=2, stride=2)
-        self.conv = DoubleConv(in_channels, out_channels)
-
-    def forward(self, x1, x2):
-        x1 = self.up(x1)
-        x = torch.cat([x2, x1], dim=1)
-        return self.conv(x)
-
-class OutConv(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(OutConv, self).__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size=1)
-
-    def forward(self, x):
-        return self.conv(x)
     
 # training_utils.py########################################################
 
@@ -741,6 +954,8 @@ def calculate_gamma_index(ref_data, eval_data, dose_threshold=0.03, distance_mm=
 
     return gamma_passing_rate
 
+    ##############################################################################
+
 def weighted_mse_loss(input, target, weights):
     squared_error = (input - target) ** 2
     weighted_squared_error = squared_error * weights
@@ -752,30 +967,58 @@ def weighted_l1_loss(input, target, weights):
     weighted_absolute_error = absolute_error * weights
     return weighted_absolute_error.mean()
 
-def initialize_weights(model):
-    """Initialize the weights of the model using Xavier initialization"""
-    for m in model.modules():
-        if isinstance(m, (nn.Conv2d, nn.Linear)):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
 
 def setup_training(encoderunet, unetdecoder, resume=0):
-    lr = 1e-4
+    base_lr = 5e-5  # Target learning rate after warm-up
+    warmup_epochs = 5  # Number of epochs for the warm-up phase
+    T_0 = 10  # Epochs for the first cosine restart
+    T_mult = 2  # Restart period multiplier
+    eta_min = 1e-5  # Minimum learning rate after decay
+    weight_decay = 1e-4
+
     criterion = nn.MSELoss().to(device)
+    scaler = GradScaler()
     
     if resume == 1:
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth', 
-                              map_location=device)
-        encoderunet.load_state_dict(checkpoint['encoderunet_state_dict'])
-        unetdecoder.load_state_dict(checkpoint['unetdecoder_state_dict'])
+        # Load checkpoint
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_layernorm_checkpoint.pth', 
+                              map_location='cpu')
         
+        # Handle state dict for DDP models
+        encoderunet_state = {}
+        for k, v in checkpoint['encoderunet_state_dict'].items():
+            # Remove 'module.' if it exists (from DDP) or add if needed
+            if k.startswith('module.'):
+                encoderunet_state[k] = v
+            else:
+                encoderunet_state[f'module.{k}'] = v
+                
+        unetdecoder_state = {}
+        for k, v in checkpoint['unetdecoder_state_dict'].items():
+            if k.startswith('module.'):
+                unetdecoder_state[k] = v
+            else:
+                unetdecoder_state[f'module.{k}'] = v
+        
+        # Load state dicts
+        encoderunet.load_state_dict(encoderunet_state)
+        unetdecoder.load_state_dict(unetdecoder_state)
+        
+        # Create optimizer first
         optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                         lr=lr, weight_decay=1e-2)
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+                         lr=base_lr, weight_decay=weight_decay)
+        
+        # Load optimizer state dict
+        optimizer_state_dict = checkpoint['optimizer_state_dict']
+        
+        # Move optimizer state to correct device
+        for state in optimizer_state_dict['state'].values():
+            for k, v in state.items():
+                if isinstance(v, torch.Tensor):
+                    state[k] = v.to(device)
+        
+        # Load the processed optimizer state
+        optimizer.load_state_dict(optimizer_state_dict)
         
         start_epoch = checkpoint['epoch'] + 1
         train_losses = checkpoint['train_losses']
@@ -783,41 +1026,85 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         train_accuracies = checkpoint['train_accuracies']
         val_accuracies = checkpoint['val_accuracies']
         
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
+        # Scheduler with warm-up + cosine annealing restarts
+        scheduler = LambdaLR(
+            optimizer, lr_lambda=lambda epoch: lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult)
+        )
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
-        # Load scaler state if it exists
-        scaler = GradScaler()
+        # Handle scaler state
         if 'scaler_state_dict' in checkpoint:
             scaler.load_state_dict(checkpoint['scaler_state_dict'])
+            
+        return (optimizer, scheduler, criterion, start_epoch, 
+                train_losses, val_losses, train_accuracies, 
+                val_accuracies, scaler)
     else:
-        initialize_weights(unetdecoder)
-        initialize_weights(encoderunet)
-        
+        # For encoder
+        encoderunet.apply(init_weights)
+        unetdecoder.apply(init_weights)
+
+
+        optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
+                         lr=base_lr, weight_decay=weight_decay)
+        # Scheduler with warm-up + cosine annealing restarts
+        scheduler = LambdaLR(
+            optimizer, lr_lambda=lambda epoch: lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult)
+        )
         start_epoch = 0
         train_losses = []
         val_losses = []
         train_accuracies = []
         val_accuracies = []
         
-        optimizer = AdamW(list(encoderunet.parameters()) + list(unetdecoder.parameters()), 
-                         lr=lr, weight_decay=1e-2)
-        scheduler = CosineAnnealingWarmRestarts(optimizer, T_0=10, T_mult=2, eta_min=1e-4)
-    
-    return (optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, 
-            train_accuracies, val_accuracies)
+        return (optimizer, scheduler, criterion, start_epoch, 
+                train_losses, val_losses, train_accuracies, 
+                val_accuracies, scaler)
+
+def lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult):
+    """
+    Combines warm-up with cosine annealing restarts.
+    - Warm-up: Gradually increases LR from a small value to base_lr.
+    - CosineAnnealingWarmRestarts: Periodically restarts LR using a cosine decay.
+    """
+    if epoch < warmup_epochs:
+        # Linear warm-up phase
+        return (epoch + 1) / warmup_epochs
+    else:
+        # Compute cosine annealing restart phase
+        cosine_epochs = epoch - warmup_epochs
+        T_cur = T_0
+        restart_count = 0
+
+        # Find the current restart cycle
+        while cosine_epochs >= T_cur:
+            cosine_epochs -= T_cur
+            T_cur *= T_mult
+            restart_count += 1
+
+        # Convert to tensor for cosine calculation
+        cosine_input = torch.tensor(cosine_epochs / T_cur * math.pi)
+        # Compute the learning rate scale for the current cycle
+        cosine_decay = 0.5 * (1 + torch.cos(cosine_input))
+        return eta_min / base_lr + (1 - eta_min / base_lr) * cosine_decay.item()
 
 
 # training_loop.py
 
-def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, resume=0, profile_mode=False, max_epochs=None):
+def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0):
+    # Get training setup (now returns scaler instead of scaler_state)
+    optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies, scaler = setup_training(encoderunet, unetdecoder, resume)
+
+    # Remove this line since scaler is now directly returned from setup_training
+    # if scaler_state is not None:
+    #     scaler.load_state_dict(scaler_state)
+
+    # Get rank for printing
+    rank = dist.get_rank()
+    
     # Setup training parameters
-    EPOCHS = 300
-    optimizer, scheduler, criterion, start_epoch, train_losses, val_losses, train_accuracies, val_accuracies = setup_training(encoderunet, unetdecoder, resume)
-    
-    # Initialize gradient scaler for mixed precision training
-    scaler = GradScaler()
-    
+    EPOCHS = 600
+
     # Print settings
     print('SETTINGS')
     print('epochs:', EPOCHS)
@@ -825,56 +1112,45 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
     print('optimizer: Adam')
     print('learning rate:', optimizer.param_groups[0]['lr'])
     print('loss: weighted L1 + MSE')
-    print('mixed precision: enabled')
+    print('using mixed precision training')
 
     sys.stdout.flush()
     
     line_length = 155
     
-    epochs_to_run = max_epochs if profile_mode else EPOCHS
-    
-    # Create tensors on GPU to store history
-    history = {
-        'train_loss': torch.zeros(epochs_to_run, device=device),
-        'train_acc': torch.zeros(epochs_to_run, device=device),
-        'val_loss': torch.zeros(epochs_to_run, device=device),
-        'val_acc': torch.zeros(epochs_to_run, device=device)
-    }
-    
-    for epoch in range(start_epoch, epochs_to_run):
-        epoch_start = time.time()
-        
-        if profile_mode:
-            print(f"\nProfiling Epoch {epoch+1}")
-            
+    for epoch in range(start_epoch, EPOCHS):
+        # Synchronize GPUs before starting epoch
+        #torch.cuda.synchronize()
+        #dist.barrier()
+
         # Training
         encoderunet.train()
         unetdecoder.train()
         
-        # Use a single tensor for all losses in this epoch
-        epoch_losses = torch.zeros(len(train_loaders), device=device)
-        epoch_accuracies = torch.zeros(len(train_loaders), device=device)
+        running_train_losses = [0.0] * len(train_loaders)
+        running_train_accuracies = [0.0] * len(train_loaders)
+        
+        start_time = time.time()
         
         for i, train_loader in enumerate(train_loaders):
-            batch_count = len(train_loader)
-            total_loss = torch.zeros(1, device=device)
-            total_accuracy = torch.zeros(1, device=device)
+            loader_loss_sum = 0.0
+            loader_accuracy_sum = 0.0
             
-            for batch_data in train_loader:
-                # Unpack and move data to device in one go
-                v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p = [
-                    x.to(device) for x in batch_data
-                ]
+            for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(train_loader):
+                # Move data to device
+                v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
+                v1_weight, v2_weight = v1_weight.to(device), v2_weight.to(device)
+                arrays, arrays_p = arrays.to(device), arrays_p.to(device)
                 
                 arrays = arrays.squeeze(1)
                 arrays_p = arrays_p.squeeze(1)
                 
-                # Use autocast for mixed precision training
+                # Wrap training steps with autocast
                 with autocast():
                     # Forward pass through encoder-unet
                     outputs = encoderunet(v1, v2, scalars)
-                    #accuracy = calculate_gamma_index(outputs, arrays)
                     accuracy = 0
+                    
                     # Compute "forward loss"
                     l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
                     l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
@@ -939,7 +1215,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                             v2_weight[1:-1, -52:]
                         )
                         
-                        consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff + 
+                        consistency_loss = (mse_loss_v1_diff + mse_loss_v2_diff +
                                           mse_loss_v1_diff_2 + mse_loss_v2_diff_2)
                     
                     # Reconstruction losses
@@ -947,7 +1223,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                     mse_loss_v2 = weighted_l1_loss(v2_reconstructed, v2, v2_weight)
                     mse_loss_scalars = criterion(scalars_reconstructed, scalars) * 5
                     
-                    loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars + 
+                    loss_back = (mse_loss_v1 + mse_loss_v2 + mse_loss_scalars +
                                 penalty_loss * 10)
                     
                     mse_loss_v1_2 = weighted_l1_loss(v1_reconstructed_2, v1[1:], v1_weight[1:])
@@ -966,36 +1242,43 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                 scaler.step(optimizer)
                 scaler.update()
                 
-                # Accumulate without any .item() calls
-                total_loss += loss
-                total_accuracy += accuracy
+                # Synchronize after optimization
+                #torch.cuda.synchronize()
+                #dist.barrier()
+                
+                loader_loss_sum += loss.item()
+                loader_accuracy_sum += accuracy
             
-            # Store batch results without CPU sync
-            epoch_losses[i] = total_loss / batch_count
-            epoch_accuracies[i] = total_accuracy / batch_count
+            # Calculate averages for this loader
+            num_batches = len(train_loader)
+            running_train_losses[i] = loader_loss_sum / num_batches
+            running_train_accuracies[i] = loader_accuracy_sum / num_batches
 
-        # Store epoch metrics on GPU
-        history['train_loss'][epoch] = epoch_losses.mean()
-        history['train_acc'][epoch] = epoch_accuracies.mean()
+            # Print progress
+            #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(train_loaders)}] "
+            #      f"Batch [{batch_idx+1}/{len(train_loader)}]  "
+            #      f"Temp. Train. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
+            #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
+            #      f"{loss.item():.2e}  Temp. Train. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
 
-        # Validation (similar changes)
+
+        # Validation
         encoderunet.eval()
         unetdecoder.eval()
         
-        val_losses = torch.zeros(len(val_loaders), device=device)
-        val_accuracies = torch.zeros(len(val_loaders), device=device)
-        
-        with torch.no_grad():
+        with torch.no_grad(), autocast():
+            running_val_losses = [0.0] * len(val_loaders)
+            running_val_accuracies = [0.0] * len(val_loaders)
+            
             for i, val_loader in enumerate(val_loaders):
-                batch_count = len(val_loader)
-                total_loss = torch.zeros(1, device=device)
-                total_accuracy = torch.zeros(1, device=device)
+                loader_loss_sum = 0.0
+                loader_accuracy_sum = 0.0
                 
-                for batch_data in val_loader:
-                    # Unpack and move data to device in one go
-                    v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p = [
-                        x.to(device) for x in batch_data
-                    ]
+                for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(val_loader):
+                    # Move data to device
+                    v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
+                    v1_weight, v2_weight = v1_weight.to(device), v2_weight.to(device)
+                    arrays, arrays_p = arrays.to(device), arrays_p.to(device)
                     
                     arrays = arrays.squeeze(1)
                     arrays_p = arrays_p.squeeze(1)
@@ -1004,6 +1287,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                     outputs = encoderunet(v1, v2, scalars)
                     #accuracy = calculate_gamma_index(outputs, arrays)
                     accuracy = 0
+
                     # Compute "forward loss"
                     l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
                     l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
@@ -1089,182 +1373,240 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, re
                     # Total loss
                     loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
                     
-                    # Accumulate without any .item() calls
-                    total_loss += loss
-                    total_accuracy += accuracy
+                    loader_loss_sum += loss.item()
+                    loader_accuracy_sum += accuracy
                 
-                # Store batch results without CPU sync
-                val_losses[i] = total_loss / batch_count
-                val_accuracies[i] = total_accuracy / batch_count
+                # Calculate averages for this loader
+                num_batches = len(val_loader)
+                running_val_losses[i] = loader_loss_sum / num_batches
+                running_val_accuracies[i] = loader_accuracy_sum / num_batches
 
-        # Store validation metrics on GPU
-        history['val_loss'][epoch] = val_losses.mean()
-        history['val_acc'][epoch] = val_accuracies.mean()
+                #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(val_loaders)}] "
+                #      f"Batch [{batch_idx+1}/{len(val_loader)}]  "
+                #      f"Temp. Val. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
+                #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
+                #      f"{loss.item():.2e}  Temp. Val. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
 
-        # Only sync with CPU for printing once per epoch
-        if epoch % 1 == 0:  # Adjust frequency as needed
-            current_metrics = {
-                'train_loss': history['train_loss'][epoch].item(),
-                'train_acc': history['train_acc'][epoch].item(),
-                'val_loss': history['val_loss'][epoch].item(),
-                'val_acc': history['val_acc'][epoch].item()
-            }
+
+             # Calculate average metrics for the epoch
+        average_train_loss = sum(running_train_losses) / len(train_loaders)
+        average_train_accuracy = sum(running_train_accuracies) / len(train_loaders)
+        average_val_loss = sum(running_val_losses) / len(val_loaders)
+        average_val_accuracy = sum(running_val_accuracies) / len(val_loaders)
+
+        # Append to history
+        #train_losses.append(average_train_loss)
+        #train_accuracies.append(average_train_accuracy)
+        #val_losses.append(average_val_loss)
+        #val_accuracies.append(average_val_accuracy)
+        
+        # Step scheduler
+        scheduler.step()
+        current_lr = optimizer.param_groups[0]['lr']
+        
+        # Calculate elapsed time
+        elapsed_time = time.time() - start_time
+        
+        # Gather losses and accuracies from all GPUs
+        world_size = dist.get_world_size()
+        all_train_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
+        all_train_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
+        all_val_losses = [torch.zeros(1).to(device) for _ in range(world_size)]
+        all_val_accuracies = [torch.zeros(1).to(device) for _ in range(world_size)]
+        
+        # Convert local values to tensors
+        local_train_loss = torch.tensor([average_train_loss]).to(device)
+        local_train_acc = torch.tensor([average_train_accuracy]).to(device)
+        local_val_loss = torch.tensor([average_val_loss]).to(device)
+        local_val_acc = torch.tensor([average_val_accuracy]).to(device)
+        
+        # Gather from all GPUs
+        dist.all_gather(all_train_losses, local_train_loss)
+        dist.all_gather(all_train_accuracies, local_train_acc)
+        dist.all_gather(all_val_losses, local_val_loss)
+        dist.all_gather(all_val_accuracies, local_val_acc)
+
+        # Calculate global averages
+        global_train_loss = sum([loss.item() for loss in all_train_losses]) / world_size
+        global_train_acc = sum([acc.item() for acc in all_train_accuracies]) / world_size
+        global_val_loss = sum([loss.item() for loss in all_val_losses]) / world_size
+        global_val_acc = sum([acc.item() for acc in all_val_accuracies]) / world_size
+
+        # Print epoch summary with global averages
+        if rank == 0:
+            print(f"Epoch [{epoch+1}/{EPOCHS}] "
+                  f"Avg. Train Loss: {global_train_loss:.4e} "
+                  f"Avg. Train Accuracy: {global_train_acc:.2f} "
+                  f"Avg. Val. Loss: {global_val_loss:.4e} "
+                  f"Avg. Val. Accuracy: {global_val_acc:.2f} "
+                  f"Elap. Time: {elapsed_time:.1f} seconds "
+                  f"Current LR: {current_lr:.4e}")
             
-            print(f"Epoch [{epoch+1}/{epochs_to_run}] "
-                  f"Train Loss: {current_metrics['train_loss']:.4e} "
-                  f"Train Acc: {current_metrics['train_acc']:.2f} "
-                  f"Val Loss: {current_metrics['val_loss']:.4e} "
-                  f"Val Acc: {current_metrics['val_acc']:.2f} "
-                  f"Time: {time.time() - epoch_start:.1f}s "
-                  f"LR: {optimizer.param_groups[0]['lr']:.4e}")
+            sys.stdout.flush()
 
-        # Save checkpoint with GPU tensors
-        if epoch % 10 == 0:  # Adjust checkpoint frequency as needed
+        # Store global averages
+        train_losses.append(global_train_loss)
+        train_accuracies.append(global_train_acc)
+        val_losses.append(global_val_loss)
+        val_accuracies.append(global_val_acc)
+
+        # Only save checkpoint from rank 0
+        if rank == 0:
             checkpoint = {
                 'epoch': epoch,
-                'encoderunet_state_dict': encoderunet.state_dict(),
-                'unetdecoder_state_dict': unetdecoder.state_dict(),
+                'encoderunet_state_dict': encoderunet.module.state_dict(),
+                'unetdecoder_state_dict': unetdecoder.module.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'scaler_state_dict': scaler.state_dict(),
-                'history': history,  # Store entire history on GPU
+                'train_losses': train_losses,
+                'train_accuracies': train_accuracies,
+                'val_losses': val_losses,
+                'val_accuracies': val_accuracies,
             }
-            torch.save(checkpoint, f'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_coll45_checkpoint.pth')
+            
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_ResBlock_layernorm_checkpoint.pth')
 
-    # Only convert history to CPU at the very end
-    final_history = {
-        'train_losses': history['train_loss'].cpu().numpy().tolist(),
-        'train_accuracies': history['train_acc'].cpu().numpy().tolist(),
-        'val_losses': history['val_loss'].cpu().numpy().tolist(),
-        'val_accuracies': history['val_acc'].cpu().numpy().tolist()
-    }
+    return train_losses, val_losses, train_accuracies, val_accuracies           
 
-    return final_history
+    #######################################################################
 
-def profile_training(encoderunet, unetdecoder, train_loaders, val_loaders, device, num_epochs=2):
-    """Profile the training process for a few epochs"""
-    # Create a profiles directory if it doesn't exist
-    os.makedirs("profiles", exist_ok=True)
+
+
+
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
     
-    profiler_output = os.path.join("profiles", f'training_profile_{datetime.now().strftime("%Y%m%d_%H%M%S")}.prof')
+    dist.init_process_group(
+        "nccl", 
+        rank=rank, 
+        world_size=world_size,
+        timeout=timedelta(minutes=60)
+    )
     
-    # Start profiling
-    pr = cProfile.Profile()
-    pr.enable()
+    # Set device and CUDA settings
+    torch.cuda.set_device(rank)
+    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.deterministic = False    
+
+
+
+def cleanup():
+    dist.destroy_process_group()
+
+def train_ddp(rank, world_size, generate_flag, KM):
+    setup(rank, world_size)
     
-    try:
-        # Run training
-        train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, 
-                   resume=0, profile_mode=True, max_epochs=num_epochs)
-    finally:
-        # Ensure profiling data is saved even if training crashes
-        pr.disable()
-        stats = pstats.Stats(pr)
-        stats.sort_stats('cumulative')
-        stats.dump_stats(profiler_output)
-        print("\nTop 20 time-consuming operations:")
-        stats.print_stats(20)
-        print(f"\nProfiling data saved to: {profiler_output}")
+    device = torch.device(f'cuda:{rank}')
     
-    return profiler_output
-
-# Place this function definition before the main block where it's called
-if __name__ == "__main__":
-    # Load KM matrix
-    KM_data = scipy.io.loadmat('data/KM_1500.mat')
-    KM = KM_data['KM_1500']
-
-    # Set generation flag
-    generate_flag = 0  # Set this flag to 1 if you want to generate datasets again
-
-    # Create directories if they don't exist
-    os.makedirs("VMAT_Art_data", exist_ok=True)
-    os.makedirs("Cross_CP", exist_ok=True)
-
     train_loaders = []
     val_loaders = []
 
-    # Generate or load datasets
-    for dataset_num in range(0, 18, 1):
+    # Calculate dataset range for this rank
+    datasets_per_gpu = 640 // world_size
+    start_dataset = rank * datasets_per_gpu
+    end_dataset = start_dataset + datasets_per_gpu
+
+    # Generate or load datasets assigned to this GPU
+    for dataset_num in range(start_dataset, end_dataset):
         start_time = time.time()
 
         if generate_flag == 0:
             Art_dataset = load_dataset(dataset_num)
             if Art_dataset is None:
-                Art_dataset = generate_and_save_dataset(dataset_num)
-                print(f"Generated and saved dataset {dataset_num} because it was not found on disk")
+                Art_dataset = generate_and_save_dataset(dataset_num, KM)
+                print(f"[GPU {rank}] Generated and saved dataset {dataset_num} because it was not found on disk")
             else:
-                print(f"Loaded dataset {dataset_num} from disk")
+                print(f"[GPU {rank}] Loaded dataset {dataset_num} from disk")
         else:
-            Art_dataset = generate_and_save_dataset(dataset_num)
-            print(f"Generated and saved dataset {dataset_num}")
+            Art_dataset = generate_and_save_dataset(dataset_num, KM)
+            print(f"[GPU {rank}] Generated and saved dataset {dataset_num}")
 
-        sys.stdout.flush()
+        sys.stdout.flush()  # Ensure prints are flushed immediately
         
-        # Split into train and validation sets
+        # Split into train and validation sets (sequential split, no randomization)
         VALIDSPLIT = 0.8
         dataset_size = len(Art_dataset)
-        indices = list(range(dataset_size))
         split = int(np.floor(VALIDSPLIT * dataset_size))
-        train_indices, val_indices = indices[:split], indices[split:]
+        
+        # Sequential split
+        train_indices = list(range(split))
+        val_indices = list(range(split, dataset_size))
 
         train_ds = Subset(Art_dataset, train_indices)
         val_ds = Subset(Art_dataset, val_indices)
 
-        batch_size = 128
-        train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=False)
-        val_loader = DataLoader(val_ds, batch_size=batch_size, shuffle=False)
+        # Adjust batch size based on available GPU memory
+        batch_size = 256// world_size  # Scale batch size by number of GPUs
+    
+
+        train_loader = DataLoader(
+            train_ds, 
+            batch_size=batch_size,
+            shuffle=False,  # Keep sequential order
+            pin_memory=True
+        )
+        
+        val_loader = DataLoader(
+            val_ds, 
+            batch_size=batch_size,
+            shuffle=False,
+            pin_memory=True
+        )
 
         train_loaders.append(train_loader)
         val_loaders.append(val_loader)
 
         end_time = time.time()
-        print(f"Dataset {dataset_num} processing time: {end_time - start_time:.2f} seconds")
-        print(f"Dataset {dataset_num} is done")
+        print(f"[GPU {rank}] Dataset {dataset_num} processing time: {end_time - start_time:.2f} seconds")
+        print(f"[GPU {rank}] Dataset {dataset_num} is done")
 
-
-
+    # Initialize models
     vector_dim = 104
     scalar_count = 5
-    latent_image_size = 128
-    in_channels = 1
-    out_channels = 1
-    resize_out = 131
 
-    #device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-    print(f"\nUsing device: {device}")
 
-    encoderunet = EncoderUNet(ExtEncoder, vector_dim, scalar_count, latent_image_size, 
-                             in_channels, out_channels, resize_out, freeze_encoder=False)
-    encoderunet = encoderunet.to(device)  # Explicitly move to MPS
+    encoderunet = EncoderUNet(vector_dim, scalar_count)
+    encoderunet = encoderunet.to(device)
+    encoderunet = DDP(encoderunet, device_ids=[rank])
 
-    vector_dim = 104
-    scalar_count = 5
-    latent_image_size = 128
-    in_channels = 2
-    out_channels = 1
-    resize_in = 128
+ 
+    unetdecoder = UNetDecoder(vector_dim, scalar_count)
 
-    unetdecoder = UNetDecoder(ExtDecoder, vector_dim, scalar_count, latent_image_size,
-                             in_channels, out_channels, resize_in, freeze_encoder=False)
-    unetdecoder = unetdecoder.to(device)  # Explicitly move to MPS
+    unetdecoder = unetdecoder.to(device)
+    unetdecoder = DDP(unetdecoder, device_ids=[rank])
 
-    print("\nModel devices:")
-    print(f"encoderunet device: {next(encoderunet.parameters()).device}")
-    print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
-    # Start training
-    print("Starting training...")
-
-    # Add profiling option
-    PROFILE_MODE = True  # Set to True to enable profiling
+    if rank == 0:
+        print("\nModel devices:")
+        print(f"encoderunet device: {next(encoderunet.parameters()).device}")
+        print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
+        print("Starting training...")
     
-    if PROFILE_MODE:
-        print("Running training with profiling...")
-        profile_output = profile_training(encoderunet, unetdecoder, train_loaders, 
-                                        val_loaders, device)
-        print(f"Profiling data saved to: {profile_output}")
-    else:
-        print("Starting regular training...")
-        train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, resume=0)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
+    
+    if rank == 0:
+        print("Training completed!")
+    
+    cleanup()
 
-    print("Training completed!")
+if __name__ == "__main__":
+    # Load KM matrix
+    KM_data = scipy.io.loadmat('data/KM_1500.mat')
+    KM = KM_data['KM_1500']
+
+    # Create directories if they don't exist
+    os.makedirs("VMAT_Art_data", exist_ok=True)
+    os.makedirs("Cross_CP", exist_ok=True)
+
+    # Set generation flag
+    generate_flag = 0  # Set this flag to 1 if you want to generate datasets again
+
+    # Launch training on 2 GPUs
+    world_size = 2
+    mp.spawn(
+        train_ddp,
+        args=(world_size, generate_flag, KM),
+        nprocs=world_size,
+        join=True
+    )
