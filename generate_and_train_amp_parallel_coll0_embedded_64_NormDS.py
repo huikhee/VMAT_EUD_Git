@@ -991,11 +991,11 @@ def weighted_l1_loss(input, target, weights):
 
 
 def setup_training(encoderunet, unetdecoder, resume=0):
-    base_lr = 1e-3  # Target learning rate after warm-up
+    base_lr = 1e-4  # Target learning rate after warm-up
     warmup_epochs = 0  # Number of epochs for the warm-up phase
     T_0 = 10  # Epochs for the first cosine restart
     T_mult = 2  # Restart period multiplier
-    eta_min = 1e-4  # Minimum learning rate after decay
+    eta_min = 1e-5  # Minimum learning rate after decay
     weight_decay = 1e-4
 
     criterion = nn.MSELoss().to(device)
@@ -1003,7 +1003,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
     
     if resume == 1:
         # Load checkpoint
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_checkpoint.pth', 
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_NormDS_checkpoint.pth', 
                               map_location='cpu')
         
         # Handle state dict for DDP models
@@ -1487,7 +1487,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_NormDS_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1517,6 +1517,23 @@ def setup(rank, world_size):
 def cleanup():
     dist.destroy_process_group()
 
+def scale_dataset_in_memory(dataset):
+    """
+    Scale the dataset's internal tensors in-place, 
+    assuming:
+      - vector1, vector2, scalar2, scalar3 => [-130,130]
+      - scalar1, arrays => [0,40]
+    """
+    dataset.vector1 /= 130.0
+    dataset.vector2 /= 130.0
+    dataset.scalar2 /= 130.0
+    dataset.scalar3 /= 130.0
+
+    dataset.scalar1 /= 40.0
+    dataset.arrays /= 40.0
+
+    return dataset    
+
 def train_ddp(rank, world_size, generate_flag, KM):
     setup(rank, world_size)
     
@@ -1537,16 +1554,23 @@ def train_ddp(rank, world_size, generate_flag, KM):
         if generate_flag == 0:
             Art_dataset = load_dataset(dataset_num)
             if Art_dataset is None:
+                # If the dataset isn't on disk, generate + save
                 Art_dataset = generate_and_save_dataset(dataset_num, KM)
                 print(f"[GPU {rank}] Generated and saved dataset {dataset_num} because it was not found on disk")
             else:
                 print(f"[GPU {rank}] Loaded dataset {dataset_num} from disk")
         else:
+            # generate_flag != 0 => Always regenerate
             Art_dataset = generate_and_save_dataset(dataset_num, KM)
             print(f"[GPU {rank}] Generated and saved dataset {dataset_num}")
 
         sys.stdout.flush()  # Ensure prints are flushed immediately
-        
+
+        # --------------------------------------------------
+        #  *New Step*: Scale the dataset in memory
+        # --------------------------------------------------
+        scale_dataset_in_memory(Art_dataset)
+
         # Split into train and validation sets (sequential split, no randomization)
         VALIDSPLIT = 0.8
         dataset_size = len(Art_dataset)
@@ -1554,14 +1578,13 @@ def train_ddp(rank, world_size, generate_flag, KM):
         
         # Sequential split
         train_indices = list(range(split))
-        val_indices = list(range(split, dataset_size))
+        val_indices   = list(range(split, dataset_size))
 
         train_ds = Subset(Art_dataset, train_indices)
-        val_ds = Subset(Art_dataset, val_indices)
+        val_ds   = Subset(Art_dataset, val_indices)
 
         # Adjust batch size based on available GPU memory
-        batch_size = 256// world_size  # Scale batch size by number of GPUs
-    
+        batch_size = 256 // world_size  # Scale batch size by number of GPUs
 
         train_loader = DataLoader(
             train_ds, 
@@ -1605,7 +1628,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=1)
+    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=0)
     
     if rank == 0:
         print("Training completed!")
