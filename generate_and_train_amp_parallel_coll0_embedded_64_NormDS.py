@@ -995,7 +995,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
     warmup_epochs = 0  # Number of epochs for the warm-up phase
     T_0 = 10  # Epochs for the first cosine restart
     T_mult = 2  # Restart period multiplier
-    eta_min = 1e-5  # Minimum learning rate after decay
+    eta_min = 1e-4  # Minimum learning rate after decay
     weight_decay = 1e-4
 
     criterion = nn.MSELoss().to(device)
@@ -1139,7 +1139,10 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
     sys.stdout.flush()
     
     line_length = 155
-    
+
+    # factor for unetdecoder loss
+    unetdecoder_loss_factor = 10
+
     for epoch in range(start_epoch, EPOCHS):
         # Synchronize GPUs before starting epoch
         #torch.cuda.synchronize()
@@ -1256,7 +1259,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                                   penalty_loss_2 * 10)
                     
                     # Total loss
-                    loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
+                    loss = loss_for + unetdecoder_loss_factor*loss_back + loss_for_2 + unetdecoder_loss_factor*loss_back_2 + consistency_loss
                 
                 # Optimization step with gradient scaling
                 optimizer.zero_grad()
@@ -1279,8 +1282,8 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
             # Print progress
             #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(train_loaders)}] "
             #      f"Batch [{batch_idx+1}/{len(train_loader)}]  "
-            #      f"Temp. Train. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
-            #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
+            #      f"Temp. Train. Loss: {loss_for.item():.2e} {unetdecoder_loss_factor*loss_back.item():.2e} "
+            #      f"{loss_for_2.item():.2e} {unetdecoder_loss_factor*loss_back_2.item():.2e} {consistency_loss.item():.2e} "
             #      f"{loss.item():.2e}  Temp. Train. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
 
 
@@ -1393,7 +1396,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                                   penalty_loss_2 * 10)
                     
                     # Total loss
-                    loss = loss_for + loss_back + loss_for_2 + loss_back_2 + consistency_loss
+                    loss = loss_for + unetdecoder_loss_factor*loss_back + loss_for_2 + unetdecoder_loss_factor*loss_back_2 + consistency_loss
                     
                     loader_loss_sum += loss.item()
                     loader_accuracy_sum += accuracy
@@ -1405,8 +1408,8 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
 
                 #print(f"Epoch [{epoch+1}/{EPOCHS}] Loader [{i+1}/{len(val_loaders)}] "
                 #      f"Batch [{batch_idx+1}/{len(val_loader)}]  "
-                #      f"Temp. Val. Loss: {loss_for.item():.2e} {loss_back.item():.2e} "
-                #      f"{loss_for_2.item():.2e} {loss_back_2.item():.2e} {consistency_loss.item():.2e} "
+                #      f"Temp. Val. Loss: {loss_for.item():.2e} {unetdecoder_loss_factor*loss_back.item():.2e} "
+                #      f"{loss_for_2.item():.2e} {unetdecoder_loss_factor*loss_back_2.item():.2e} {consistency_loss.item():.2e} "
                 #      f"{loss.item():.2e}  Temp. Val. Acc.: {accuracy:.2f}".ljust(line_length), end='\r')
 
 

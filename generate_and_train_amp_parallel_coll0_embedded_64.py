@@ -991,7 +991,7 @@ def weighted_l1_loss(input, target, weights):
 
 
 def setup_training(encoderunet, unetdecoder, resume=0):
-    base_lr = 1e-3  # Target learning rate after warm-up
+    base_lr = 1e-4  # Target learning rate after warm-up
     warmup_epochs = 0  # Number of epochs for the warm-up phase
     T_0 = 10  # Epochs for the first cosine restart
     T_mult = 2  # Restart period multiplier
@@ -1033,6 +1033,11 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         # Load optimizer state dict
         optimizer_state_dict = checkpoint['optimizer_state_dict']
         
+        # Update learning rate in optimizer state dict
+        for param_group in optimizer_state_dict['param_groups']:
+            param_group['lr'] = base_lr
+            param_group['initial_lr'] = base_lr
+        
         # Move optimizer state to correct device
         for state in optimizer_state_dict['state'].values():
             for k, v in state.items():
@@ -1052,7 +1057,9 @@ def setup_training(encoderunet, unetdecoder, resume=0):
         scheduler = LambdaLR(
             optimizer, lr_lambda=lambda epoch: lr_warmup_cosine(epoch, warmup_epochs, base_lr, eta_min, T_0, T_mult)
         )
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        
+        # Optionally, load scheduler state if you want to maintain the cycle position
+        # scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         
         # Handle scaler state
         if 'scaler_state_dict' in checkpoint:
@@ -1548,7 +1555,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         sys.stdout.flush()  # Ensure prints are flushed immediately
         
         # Split into train and validation sets (sequential split, no randomization)
-        VALIDSPLIT = 0.8
+        VALIDSPLIT = 0.8125
         dataset_size = len(Art_dataset)
         split = int(np.floor(VALIDSPLIT * dataset_size))
         
