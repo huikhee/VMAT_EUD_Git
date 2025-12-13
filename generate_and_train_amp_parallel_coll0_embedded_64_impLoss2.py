@@ -984,6 +984,11 @@ def weighted_mse_loss(input, target, weights):
     loss = weighted_squared_error.mean()
     return loss
 
+def mse_loss(input, target):
+    squared_error = (input - target) ** 2
+    loss = squared_error.mean()
+    return loss
+
 def weighted_l1_loss(input, target, weights):
     absolute_error = torch.abs(input - target)
     weighted_absolute_error = absolute_error * weights
