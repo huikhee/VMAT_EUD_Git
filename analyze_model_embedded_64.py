@@ -20,16 +20,10 @@ def load_trained_models(checkpoint_path, device):
     latent_image_size = 128
     
     # Initialize encoder
-    encoderunet = EncoderUNet(
-        ExtEncoder, vector_dim, scalar_count, latent_image_size,
-        in_channels=1, out_channels=1, resize_out=131
-    )
+    encoderunet = EncoderUNet(vector_dim, scalar_count)
     
     # Initialize decoder
-    unetdecoder = UNetDecoder(
-        ExtDecoder, vector_dim, scalar_count, latent_image_size,
-        in_channels=2, out_channels=1, resize_in=128
-    )
+    unetdecoder = UNetDecoder(vector_dim, scalar_count)
     
     # Load checkpoint
     checkpoint = torch.load(checkpoint_path, map_location=device)
@@ -43,14 +37,24 @@ def load_trained_models(checkpoint_path, device):
 def analyze_parameters(model, model_name):
     """Analyze model parameters distribution."""
     stats = defaultdict(dict)
+    has_nans = False
     
     for name, param in model.named_parameters():
         if param.requires_grad:
-            # Calculate statistics
-            stats[name]['mean'] = param.data.mean().item()
-            stats[name]['std'] = param.data.std().item()
-            stats[name]['min'] = param.data.min().item()
-            stats[name]['max'] = param.data.max().item()
+            # Check for NaNs
+            if torch.isnan(param.data).any():
+                print(f"WARNING: Found NaNs in parameter {name}")
+                has_nans = True
+            
+            # For parameters with more than 1 value
+            if param.numel() > 1:
+                stats[name]['mean'] = param.data.mean().item()
+                stats[name]['std'] = param.data.std().item()
+                stats[name]['min'] = param.data.min().item()
+                stats[name]['max'] = param.data.max().item()
+            else:
+                # Special handling for single-value parameters
+                stats[name]['value'] = param.data.item()
             
             # Plot histogram
             plt.figure(figsize=(10, 4))
@@ -61,15 +65,22 @@ def analyze_parameters(model, model_name):
             plt.savefig(f'analysis_results/{model_name}/parameters/{name.replace(".", "_")}_dist.png')
             plt.close()
     
+    if not has_nans:
+        print(f"No NaNs found in {model_name} parameters")
     return stats
 
 def analyze_activations(model, input_batch, model_name):
     """Analyze activations throughout the model."""
     activations = {}
-    hooks = []
+    has_nans = False
+    hooks = []  # Initialize hooks list
     
     def hook_fn(name):
         def hook(module, input, output):
+            if torch.isnan(output).any():
+                print(f"WARNING: Found NaNs in activation {name}")
+                nonlocal has_nans  # Use nonlocal instead of global
+                has_nans = True
             activations[name] = output.detach()
         return hook
     
@@ -90,10 +101,9 @@ def analyze_activations(model, input_batch, model_name):
     activation_stats = {}
     for name, activation in activations.items():
         if activation.dim() > 1:  # Skip 1D tensors
-            # Calculate statistics
             activation_stats[name] = {
                 'mean': activation.mean().item(),
-                'std': activation.std().item(),
+                'std': activation.std().item() if activation.numel() > 1 else 'N/A (single value)',
                 'sparsity': (activation == 0).float().mean().item(),
                 'shape': list(activation.shape)
             }
@@ -119,6 +129,8 @@ def analyze_activations(model, input_batch, model_name):
                 plt.savefig(f'analysis_results/{model_name}/feature_maps/{name.replace(".", "_")}_maps.png')
                 plt.close()
     
+    if not has_nans:
+        print(f"No NaNs found in {model_name} activations")
     return activation_stats
 
 def generate_analysis_report(param_stats, activation_stats, model_name):
@@ -147,7 +159,7 @@ def generate_analysis_report(param_stats, activation_stats, model_name):
 def main():
     # Setup
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint_path = 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_checkpoint.pth'
+    checkpoint_path = 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_impLoss_checkpoint.pth'
     
     # Create directories for results
     for model_name in ['encoder', 'decoder']:
