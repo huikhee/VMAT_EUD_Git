@@ -21,7 +21,7 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total
 #    nvidia-smi --id=$GPU_ID --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 1 > $HOME/VMAT_EUD/gpu_${GPU_ID}_usage.log &
 #done
 
-srun python generate_and_train_amp_parallel_coll0_embedded_64_impLoss.py
+srun python generate_and_train_amp_parallel_coll0_embedded_64_impLoss2.py
 
 # Kill the GPU monitoring process after the training script finishes
 pkill -f nvidia-smi

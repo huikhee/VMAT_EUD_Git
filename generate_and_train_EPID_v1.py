@@ -984,6 +984,11 @@ def weighted_mse_loss(input, target, weights):
     loss = weighted_squared_error.mean()
     return loss
 
+def mse_loss(input, target):
+    squared_error = (input - target) ** 2
+    loss = squared_error.mean()
+    return loss
+
 def weighted_l1_loss(input, target, weights):
     absolute_error = torch.abs(input - target)
     weighted_absolute_error = absolute_error * weights
@@ -1003,7 +1008,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
     
     if resume == 1:
         # Load checkpoint
-        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_impLoss_NormDS_checkpoint.pth', 
+        checkpoint = torch.load('Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_impLoss2_checkpoint.pth', 
                               map_location='cpu')
         
         # Handle state dict for DDP models
@@ -1132,7 +1137,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
     rank = dist.get_rank()
     
     # Setup training parameters
-    EPOCHS = 600
+    EPOCHS = 2000
 
     # Print settings
     print('SETTINGS')
@@ -1181,10 +1186,10 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     accuracy = 0
                     
                     # Compute "forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars[:,0,0]
-                    loss_for = (l1_loss_per_sample * weight).mean()
+                    weights = 1/scalars[:,0,0]  # [B]
+                    # Reshape weights to match arrays dimensions (B, H, W)
+                    weights = weights.view(-1, 1, 1).expand(-1, arrays.size(1), arrays.size(2))
+                    loss_for = weighted_mse_loss(outputs, arrays, weights)
                     
                     # First decoder pass
                     arrays_con = torch.cat([arrays_p, arrays], dim=1)
@@ -1196,10 +1201,9 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                                           scalars_reconstructed.unsqueeze(1))
                     
                     # Compute "second pass forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
-                    loss_for_2 = (l1_loss_per_sample * weight).mean()
+                    # Use expand instead of repeat for the second weights tensor
+                    weights_2 = (1/scalars_reconstructed[:,0]).view(-1, 1, 1).expand(-1, arrays.size(1), arrays.size(2))
+                    loss_for_2 = weighted_mse_loss(outputs_2, arrays, weights_2)
                     
                     # Second decoder pass
                     arrays_p = outputs[:-1]
@@ -1327,10 +1331,10 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     accuracy = 0
 
                     # Compute "forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars[:,0,0]
-                    loss_for = (l1_loss_per_sample * weight).mean()
+                    weights = 1/scalars[:,0,0]  # [B]
+                    # Reshape weights to match arrays dimensions (B, H, W)
+                    weights = weights.view(-1, 1, 1).expand(-1, arrays.size(1), arrays.size(2))
+                    loss_for = weighted_mse_loss(outputs, arrays, weights)
                     
                     # First decoder pass
                     arrays_con = torch.cat([arrays_p, arrays], dim=1)
@@ -1342,10 +1346,9 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                                           scalars_reconstructed.unsqueeze(1))
                     
                     # Compute "second pass forward loss"
-                    l1_loss_per_element = F.l1_loss(outputs_2, arrays, reduction='none')
-                    l1_loss_per_sample = l1_loss_per_element.sum(dim=[2, 3]).squeeze()
-                    weight = 1/scalars_reconstructed.unsqueeze(1)[:,0,0]
-                    loss_for_2 = (l1_loss_per_sample * weight).mean()
+                    # Use expand instead of repeat for the second weights tensor
+                    weights_2 = (1/scalars_reconstructed[:,0]).view(-1, 1, 1).expand(-1, arrays.size(1), arrays.size(2))
+                    loss_for_2 = weighted_mse_loss(outputs_2, arrays, weights_2)
                     
                     # Second decoder pass setup
                     arrays_p = outputs[:-1]
@@ -1503,7 +1506,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_impLoss_NormDS_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/Cross_VMAT_Artifical_data_1500_01Dec_amp_parallel_coll0_embedded_64_impLoss2_checkpoint.pth')
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1514,7 +1517,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12356'
+    os.environ['MASTER_PORT'] = '12355'
     
     dist.init_process_group(
         "nccl", 
@@ -1532,23 +1535,6 @@ def setup(rank, world_size):
 
 def cleanup():
     dist.destroy_process_group()
-
-def scale_dataset_in_memory(dataset):
-    """
-    Scale the dataset's internal tensors in-place, 
-    assuming:
-      - vector1, vector2, scalar2, scalar3 => [-130,130]
-      - scalar1, arrays => [0,40]
-    """
-    dataset.vector1 /= 130.0
-    dataset.vector2 /= 130.0
-    dataset.scalar2 /= 130.0
-    dataset.scalar3 /= 130.0
-
-    dataset.scalar1 /= 40.0
-    dataset.arrays /= 40.0
-
-    return dataset    
 
 def train_ddp(rank, world_size, generate_flag, KM):
     setup(rank, world_size)
@@ -1579,11 +1565,6 @@ def train_ddp(rank, world_size, generate_flag, KM):
             print(f"[GPU {rank}] Generated and saved dataset {dataset_num}")
 
         sys.stdout.flush()  # Ensure prints are flushed immediately
-
-        # --------------------------------------------------
-        #  *New Step*: Scale the dataset in memory
-        # --------------------------------------------------
-        scale_dataset_in_memory(Art_dataset)
         
         # Split into train and validation sets (sequential split, no randomization)
         VALIDSPLIT = 0.8125
