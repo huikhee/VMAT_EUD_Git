@@ -625,16 +625,17 @@ class DecoderBlock(nn.Module):
 # -------------------------------------------------------------------------
 class EncoderUNet(nn.Module):
     """
-    Encodes two vectors (each ~ [B, 104]) + multiple scalars (e.g. 5 scalars)
-    into a single-channel 131×131 output image via a UNet-like architecture.
-    
-    Key points:
-      - Each scalar is individually expanded to 16 dims via a separate Linear.
-      - The two vectors are flattened and combined, then projected to 128 dims.
-      - Combined dimension => 128 + (scalar_count*16).
-      - Mapped to 1×64×64 "latent image".
-      - Passes through 3-level encoder + bottleneck + 3-level decoder.
-      - Upsamples from 64×64 to 128×128, then final resize to 131×131.
+    v4: Same UNet image synthesis as v1, but uses a token-based Transformer
+    encoder with a dedicated CLS aggregation token.
+
+    Tokenization (total tokens = 108):
+      - 1 CLS token (learned; used for pooling)
+      - 1 MU token (MU)
+      - 2 jaw tokens (jaw1 prev/curr, jaw2 prev/curr)
+      - 104 leaf tokens:
+          * leaves 1..52 from vector1: [leaf_i_prev, leaf_i_curr]
+          * leaves 53..104 from vector2: [leaf_i_prev, leaf_i_curr]
+    The CLS token output is projected to a 1×64×64 latent image.
     """
     def __init__(self, vector_dim, scalar_count):
         super(EncoderUNet, self).__init__()
@@ -643,28 +644,47 @@ class EncoderUNet(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         
         # -----------------------------------------------------------------
-        # 1) Vector processing
-        #    - Expecting vector1, vector2 each ~ [B, 104]
-        #    - Combine => [B, 2*vector_dim], project to [B, 128]
+        # 1) Parameter (v1/v2/scalars) -> Transformer -> latent image
         # -----------------------------------------------------------------
-        self.vector_fc = nn.Linear(vector_dim * 2, 128)
-        self.vector_norm = nn.LayerNorm(128)  # optional normalization
-        
-        # -----------------------------------------------------------------
-        # 2) Scalar processing
-        #    - Each scalar => 1->16
-        #    - total scalar_count => scalar_count*16
-        # -----------------------------------------------------------------
-        self.scalar_fc_list = nn.ModuleList([
-            nn.Linear(1, 16) for _ in range(scalar_count)
-        ])
-        self.scalar_norm = nn.LayerNorm(scalar_count * 16)
-        
-        # -----------------------------------------------------------------
-        # 3) Combine vector+scalar => feed to latent_to_image => 1×64×64
-        # -----------------------------------------------------------------
-        in_features = 128 + scalar_count * 16  # e.g. 128 + 5*16 = 128 + 80 = 208
-        self.latent_to_image = nn.Linear(in_features, 64 * 64)  # => 4096 => (1,64,64)
+        self.vector_dim = int(vector_dim)
+        self.scalar_count = int(scalar_count)
+        if self.vector_dim % 2 != 0:
+            raise ValueError(f"vector_dim must be even (prev+curr); got {self.vector_dim}")
+        self.leaf_bins = self.vector_dim // 2  # 104 -> 52
+
+        self.d_model = 128
+        nhead = 4
+        ff_dim = 256
+
+        # Dedicated CLS token for aggregation
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, self.d_model))
+
+        # Token embeddings by type
+        self.mu_token_embed = nn.Linear(1, self.d_model)
+        self.jaw_token_embed = nn.Linear(2, self.d_model)
+        self.leaf_token_embed = nn.Linear(2, self.d_model)
+
+        # Positional embedding for 108 tokens:
+        # [CLS] + [MU] + [jaw1] + [jaw2] + [104 leaf tokens]
+        self.num_tokens = 1 + 1 + 2 + self.vector_dim
+        self.param_pos_embed = nn.Parameter(torch.zeros(1, self.num_tokens, self.d_model))
+
+        enc_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=nhead,
+            dim_feedforward=ff_dim,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.param_transformer = nn.TransformerEncoder(enc_layer, num_layers=3)
+        self.param_norm = nn.LayerNorm(self.d_model)
+
+        # Project transformer global token -> 64x64 latent image
+        self.latent_to_image = nn.Linear(self.d_model, 64 * 64)
+
+        nn.init.normal_(self.param_pos_embed, std=0.02)
+        nn.init.normal_(self.cls_token, std=0.02)
         
         # -----------------------------------------------------------------
         # 4) UNet encoder
@@ -705,48 +725,48 @@ class EncoderUNet(nn.Module):
           (B, 1, 131, 131) single-channel output image
         """
         # -----------------------------------------------------------------
-        # Flatten vectors
+        # Parameter transformer: (v1/v2/scalars) -> latent_image (B,1,64,64)
         # -----------------------------------------------------------------
         B = vector1.size(0)
-        vector1 = vector1.view(B, -1)  # => [B, 104]
-        vector2 = vector2.view(B, -1)  # => [B, 104]
-        
-        # Combine => [B, 208] if vector_dim=104
-        vec_input = torch.cat([vector1, vector2], dim=1)  # => [B, 2*vector_dim]
-        
-        # Pass through fc + norm + relu => [B, 128]
-        vec_features = self.vector_fc(vec_input)
-        vec_features = self.vector_norm(vec_features)
-        vec_features = self.relu(vec_features)
-        
-        # -----------------------------------------------------------------
-        # Process scalars individually
-        # -----------------------------------------------------------------
-        # If scalars is [B,1,5], squeeze dim=1 => [B,5]
+        vector1 = vector1.view(B, -1)  # [B, 104]
+        vector2 = vector2.view(B, -1)  # [B, 104]
+
+        # Scalars: [B,1,5] or [B,1,5,1] -> [B,5]
+        if scalars.dim() == 4 and scalars.size(-1) == 1:
+            scalars = scalars.squeeze(-1)
         if scalars.dim() == 3 and scalars.size(1) == 1:
-            scalars = scalars.squeeze(1)  # => [B, scalar_count]
-        
-        # Encode each scalar => 16 dims
-        scalar_list = []
-        for i, fc_layer in enumerate(self.scalar_fc_list):
-            # scalars[:, i] => [B], expand => [B,1]
-            scalar_i = scalars[:, i].unsqueeze(1)
-            scalar_i_emb = fc_layer(scalar_i)  # => [B,16]
-            scalar_list.append(scalar_i_emb)
-        
-        # Concatenate => [B, scalar_count*16]
-        scalar_features = torch.cat(scalar_list, dim=1)  # => e.g. [B, 80] if 5 scalars
-        scalar_features = self.scalar_norm(scalar_features)
-        scalar_features = self.relu(scalar_features)
-        
-        # -----------------------------------------------------------------
-        # Combine vector features + scalar features => feed to latent_to_image
-        # -----------------------------------------------------------------
-        combined = torch.cat([vec_features, scalar_features], dim=1)  
-        # => [B, 128 + scalar_count*16]
-        
-        latent_image = self.latent_to_image(combined)     # => [B, 4096] if 64x64
-        latent_image = latent_image.view(B, 1, 64, 64)    # => [B,1,64,64]
+            scalars = scalars.squeeze(1)
+
+        # MU token: (B,1) -> (B,1,d_model)
+        mu = scalars[:, 0:1]
+        mu_token = self.mu_token_embed(mu).unsqueeze(1)
+
+        # Jaw tokens: jaw1=[1,2], jaw2=[3,4] => (B,2,2) -> (B,2,d_model)
+        jaw1 = scalars[:, 1:3]
+        jaw2 = scalars[:, 3:5]
+        jaw_feats = torch.stack([jaw1, jaw2], dim=1)
+        jaw_tokens = self.jaw_token_embed(jaw_feats)
+
+        # Leaf tokens: 104 tokens, each is [prev, curr]
+        lb = self.leaf_bins  # 52
+        v1_prev = vector1[:, :lb]
+        v1_curr = vector1[:, lb:]
+        v2_prev = vector2[:, :lb]
+        v2_curr = vector2[:, lb:]
+
+        leaf1 = torch.stack([v1_prev, v1_curr], dim=-1)  # (B,52,2)
+        leaf2 = torch.stack([v2_prev, v2_curr], dim=-1)  # (B,52,2)
+        leaf_feats = torch.cat([leaf1, leaf2], dim=1)    # (B,104,2)
+        leaf_tokens = self.leaf_token_embed(leaf_feats)  # (B,104,d_model)
+
+        cls = self.cls_token.expand(B, -1, -1)  # (B,1,d_model)
+
+        tokens = torch.cat([cls, mu_token, jaw_tokens, leaf_tokens], dim=1)  # (B,108,d_model)
+        tokens = tokens + self.param_pos_embed[:, :tokens.size(1), :]
+        tokens = self.param_transformer(tokens)
+        pooled = self.param_norm(tokens[:, 0, :])
+
+        latent_image = self.latent_to_image(pooled).view(B, 1, 64, 64)
         
         # -----------------------------------------------------------------
         # UNet encoder
@@ -789,7 +809,11 @@ class UNetDecoder(nn.Module):
          (b) 128->64 by MaxPool2d
       2) Pass through a UNet (3 encoder levels + bottleneck + 3 decoder levels)
       3) Squeeze channels to 1 (1x64x64)
-      4) Flatten and produce reconstructed vectors/scalars
+                4) v5: Transformer token heads with structured query design:
+                        - patch-token Transformer encoder over the latent map
+                        - cross-attention query decoders with:
+                            (1) typed scalar queries (MU + jaw1 + jaw2)
+                            (2) leaf queries predicted as (prev,curr) pairs (52 tokens per bank)
     """
     def __init__(self, vector_dim, scalar_count):
         super(UNetDecoder, self).__init__()
@@ -827,15 +851,72 @@ class UNetDecoder(nn.Module):
         self.final_conv = nn.Conv2d(32, 1, kernel_size=3, padding=1)
         
         # --------------------
-        # Flatten + FC layers
+        # Transformer heads (replace flatten+FC)
         # --------------------
-        # Flatten from (1,64,64) => 4096
-        self.fc_main = nn.Linear(64 * 64, 512)
-        self.fc_norm = nn.LayerNorm(512)
-        
-        self.vector_fc1 = nn.Linear(512, vector_dim)
-        self.vector_fc2 = nn.Linear(512, vector_dim)
-        self.scalar_fc  = nn.Linear(512, scalar_count)
+        self.vector_dim = int(vector_dim)
+        self.scalar_count = int(scalar_count)
+
+        self.d_model = 128
+        nhead = 4
+        ff_dim = 256
+        patch = 4  # 64x64 -> 16x16 = 256 tokens (more detail)
+        num_patches = (64 // patch) * (64 // patch)
+
+        self.patch_embed = nn.Conv2d(1, self.d_model, kernel_size=patch, stride=patch, bias=True)
+        self.img_pos_embed = nn.Parameter(torch.zeros(1, num_patches, self.d_model))
+
+        img_layer = nn.TransformerEncoderLayer(
+            d_model=self.d_model,
+            nhead=nhead,
+            dim_feedforward=ff_dim,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.img_transformer = nn.TransformerEncoder(img_layer, num_layers=2)
+
+        dec_layer = nn.TransformerDecoderLayer(
+            d_model=self.d_model,
+            nhead=nhead,
+            dim_feedforward=ff_dim,
+            dropout=0.0,
+            batch_first=True,
+            norm_first=True,
+        )
+        self.cross_decoder = nn.TransformerDecoder(dec_layer, num_layers=2)
+
+        # --------------------
+        # v5: structured queries (typed + prev/curr pairing)
+        # --------------------
+        if self.vector_dim % 2 != 0:
+            raise ValueError(f"vector_dim must be even (prev+curr). Got: {self.vector_dim}")
+        self.leaf_bins = self.vector_dim // 2  # 52 when vector_dim=104
+
+        # Leaf queries: 52 base tokens. A bank embedding distinguishes v1 vs v2.
+        self.leaf_query_base = nn.Parameter(torch.zeros(1, self.leaf_bins, self.d_model))
+        self.bank_embed = nn.Parameter(torch.zeros(2, self.d_model))  # [0]=v1, [1]=v2
+
+        # Typed scalar queries:
+        # - MU: one token -> 1 value
+        # - Jaws: two tokens (jaw1, jaw2) -> each token -> (prev,curr)
+        # Scalar ordering remains: [MU, jaw1_prev, jaw1_curr, jaw2_prev, jaw2_curr]
+        self.mu_query = nn.Parameter(torch.zeros(1, 1, self.d_model))
+        self.jaw_query = nn.Parameter(torch.zeros(1, 2, self.d_model))
+
+        # Output projections:
+        # - Leaves predicted as (prev,curr) pairs for each of the 52 bins per bank
+        self.v1_out2 = nn.Linear(self.d_model, 2)
+        self.v2_out2 = nn.Linear(self.d_model, 2)
+        # - MU predicted as scalar
+        self.mu_out = nn.Linear(self.d_model, 1)
+        # - Jaws predicted as (prev,curr) pairs per jaw token
+        self.jaw_out = nn.Linear(self.d_model, 2)
+
+        nn.init.normal_(self.img_pos_embed, std=0.02)
+        nn.init.normal_(self.leaf_query_base, std=0.02)
+        nn.init.normal_(self.bank_embed, std=0.02)
+        nn.init.normal_(self.mu_query, std=0.02)
+        nn.init.normal_(self.jaw_query, std=0.02)
 
     def forward(self, x):
         """
@@ -843,6 +924,10 @@ class UNetDecoder(nn.Module):
         Returns:
             reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
         """
+        # Some datasets store as (B, 2, 1, H, W). Coerce to (B, 2, H, W).
+        if x.dim() == 5 and x.size(2) == 1:
+            x = x.squeeze(2)
+
         # --------------------
         # Two-step downsampling
         # --------------------
@@ -875,19 +960,50 @@ class UNetDecoder(nn.Module):
         latent_dec = out  # shared latent from images
 
         # --------------------
-        # Flatten and feed into FC layers
+        # Patch tokens + transformer + cross-attention queries
         # --------------------
-        out = out.view(out.size(0), -1)  # (B, 4096)
-        
-        # Main FC
-        out = self.fc_main(out)     # (B, 512)
-        out = self.fc_norm(out)
-        out = self.relu(out)
-        
-        # Separate heads for reconstructed vectors & scalars
-        reconstructed_vector1 = self.vector_fc1(out)
-        reconstructed_vector2 = self.vector_fc2(out)
-        reconstructed_scalars = self.scalar_fc(out)
+        tokens = self.patch_embed(latent_dec)  # (B, d_model, 16, 16) when patch=4
+        tokens = tokens.flatten(2).transpose(1, 2)  # (B, 256, d_model) when patch=4
+        tokens = tokens + self.img_pos_embed[:, :tokens.size(1), :]
+        memory = self.img_transformer(tokens)  # (B, num_patches, d_model)
+
+        B = memory.size(0)
+
+        # --------------------
+        # v5 leaf decoding: 52 tokens per bank, each predicts (prev,curr)
+        # --------------------
+        leaf_base = self.leaf_query_base.expand(B, -1, -1)  # (B,52,d)
+
+        v1_bank = self.bank_embed[0].view(1, 1, -1)
+        v2_bank = self.bank_embed[1].view(1, 1, -1)
+
+        v1_tgt = leaf_base + v1_bank
+        v2_tgt = leaf_base + v2_bank
+
+        v1_feat = self.cross_decoder(v1_tgt, memory)  # (B,52,d)
+        v2_feat = self.cross_decoder(v2_tgt, memory)  # (B,52,d)
+
+        v1_pair = self.v1_out2(v1_feat)  # (B,52,2)
+        v2_pair = self.v2_out2(v2_feat)  # (B,52,2)
+
+        # Re-pack to match training target layout: [prev52, curr52] -> 104
+        reconstructed_vector1 = torch.cat([v1_pair[:, :, 0], v1_pair[:, :, 1]], dim=1)
+        reconstructed_vector2 = torch.cat([v2_pair[:, :, 0], v2_pair[:, :, 1]], dim=1)
+
+        # --------------------
+        # v5 scalar decoding: typed MU + jaw1/jaw2 tokens
+        # --------------------
+        mu_tgt = self.mu_query.expand(B, -1, -1)    # (B,1,d)
+        jaw_tgt = self.jaw_query.expand(B, -1, -1)  # (B,2,d)
+
+        mu_feat = self.cross_decoder(mu_tgt, memory)    # (B,1,d)
+        jaw_feat = self.cross_decoder(jaw_tgt, memory)  # (B,2,d)
+
+        mu_pred = self.mu_out(mu_feat).squeeze(-1)  # (B,1)
+        jaw_pred = self.jaw_out(jaw_feat)           # (B,2,2)
+        jaw_flat = jaw_pred.reshape(B, 4)           # (B,4) = [jaw1_prev,jaw1_curr,jaw2_prev,jaw2_curr]
+
+        reconstructed_scalars = torch.cat([mu_pred, jaw_flat], dim=1)  # (B,5)
         
         return reconstructed_vector1, reconstructed_vector2, reconstructed_scalars, latent_dec
 
@@ -997,12 +1113,24 @@ def weighted_l1_loss(input, target, weights):
     return weighted_absolute_error.mean()
 
 
+def ensure_nchw_epid(x):
+    """Coerce EPID tensors to (B, C, H, W).
+
+    Some datasets store EPID images as (B, 1, 1, H, W). The UNet expects 4D.
+    """
+    if x.dim() == 5 and x.size(2) == 1:
+        x = x.squeeze(2)
+    if x.dim() == 3:
+        x = x.unsqueeze(1)
+    return x
+
+
 def setup_training(encoderunet, unetdecoder, resume=0):
     base_lr = 1e-4  # Target learning rate after warm-up
     warmup_epochs = 0  # Number of epochs for the warm-up phase
     T_0 = 10  # Epochs for the first cosine restart
     T_mult = 2  # Restart period multiplier
-    eta_min = 1e-4  # Minimum learning rate after decay
+    eta_min = 1e-6  # Minimum learning rate after decay (enable annealing)
     weight_decay = 1e-4
 
     criterion = nn.MSELoss().to(device)
@@ -1010,7 +1138,7 @@ def setup_training(encoderunet, unetdecoder, resume=0):
     
     if resume == 1:
         # Load checkpoint
-        checkpoint = torch.load('Cross_CP/EPID_v1_15Dec25_checkpoint.pth', 
+        checkpoint = torch.load('Cross_CP/EPID_v5_17Dec25_checkpoint.pth', 
                               map_location='cpu')
         
         # Handle state dict for DDP models
@@ -1177,9 +1305,9 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
                 v1_weight, v2_weight = v1_weight.to(device), v2_weight.to(device)
                 arrays, arrays_p = arrays.to(device), arrays_p.to(device)
-                
-                arrays = arrays.squeeze(1)
-                arrays_p = arrays_p.squeeze(1)
+
+                arrays = ensure_nchw_epid(arrays)
+                arrays_p = ensure_nchw_epid(arrays_p)
                 
                 # Wrap training steps with autocast
                 with autocast():
@@ -1188,9 +1316,8 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     accuracy = 0
                     
                     # Compute "forward loss"
-                    weights = 1/scalars[:,0,0]  # [B]
-                    # Reshape weights to match arrays dimensions (B, H, W)
-                    weights = weights.view(-1, 1, 1).expand(-1, arrays.size(1), arrays.size(2))
+                    mu = scalars[:, 0, 0].clamp(min=1e-6)  # [B]
+                    weights = (1.0 / mu).view(-1, 1, 1, 1)
                     loss_for = weighted_mse_loss(outputs, arrays, weights)
                     
                     # First decoder pass
@@ -1200,22 +1327,21 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     # Prepare tensors
                     v1, v2 = v1.squeeze(1), v2.squeeze(1)
                     v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
-                    scalars = scalars.squeeze(1)
+                    scalars = scalars.squeeze(1).squeeze(-1)
 
                     # Normalize vectors/scalars to keep losses numerically balanced
                     norm_vec = 130.0
-                    norm_scl = 130.0
+                    scalar_scale = scalars.new_tensor([40.0, 130.0, 130.0, 130.0, 130.0]).view(1, 5)
                     v1_pred = v1_reconstructed / norm_vec
                     v2_pred = v2_reconstructed / norm_vec
                     v1_tgt = v1 / norm_vec
                     v2_tgt = v2 / norm_vec
-                    scalars_pred = scalars_reconstructed / norm_scl
-                    scalars_tgt = scalars / norm_scl
+                    scalars_pred = scalars_reconstructed / scalar_scale
+                    scalars_tgt = scalars / scalar_scale
 
                     # Penalty losses (on normalized values)
-                    penalty_loss = torch.where(v2_pred < v1_pred,
-                                                 v1_pred - v2_pred,
-                                                 torch.zeros_like(v2_pred)).sum()
+                    v1_ref = v1_pred.detach()
+                    penalty_loss = torch.relu(v1_ref - v2_pred).pow(2).mean()
                     
                     # Consistency losses
                     consistency_loss = 0.0
@@ -1295,9 +1421,9 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     v1, v2, scalars = v1.to(device), v2.to(device), scalars.to(device)
                     v1_weight, v2_weight = v1_weight.to(device), v2_weight.to(device)
                     arrays, arrays_p = arrays.to(device), arrays_p.to(device)
-                    
-                    arrays = arrays.squeeze(1)
-                    arrays_p = arrays_p.squeeze(1)
+
+                    arrays = ensure_nchw_epid(arrays)
+                    arrays_p = ensure_nchw_epid(arrays_p)
                     
                     # Forward pass through encoder-unet
                     outputs, latent_enc = encoderunet(v1, v2, scalars)
@@ -1305,9 +1431,8 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     accuracy = 0
 
                     # Compute "forward loss"
-                    weights = 1/scalars[:,0,0]  # [B]
-                    # Reshape weights to match arrays dimensions (B, H, W)
-                    weights = weights.view(-1, 1, 1).expand(-1, arrays.size(1), arrays.size(2))
+                    mu = scalars[:, 0, 0].clamp(min=1e-6)  # [B]
+                    weights = (1.0 / mu).view(-1, 1, 1, 1)
                     loss_for = weighted_mse_loss(outputs, arrays, weights)
                     
                     # First decoder pass
@@ -1317,22 +1442,21 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                     # Prepare tensors
                     v1, v2 = v1.squeeze(1), v2.squeeze(1)
                     v1_weight, v2_weight = v1_weight.squeeze(1), v2_weight.squeeze(1)
-                    scalars = scalars.squeeze(1)
+                    scalars = scalars.squeeze(1).squeeze(-1)
 
                     # Normalize vectors/scalars for balanced losses
                     norm_vec = 130.0
-                    norm_scl = 130.0
+                    scalar_scale = scalars.new_tensor([40.0, 130.0, 130.0, 130.0, 130.0]).view(1, 5)
                     v1_pred = v1_reconstructed / norm_vec
                     v2_pred = v2_reconstructed / norm_vec
                     v1_tgt = v1 / norm_vec
                     v2_tgt = v2 / norm_vec
-                    scalars_pred = scalars_reconstructed / norm_scl
-                    scalars_tgt = scalars / norm_scl
+                    scalars_pred = scalars_reconstructed / scalar_scale
+                    scalars_tgt = scalars / scalar_scale
 
                     # Penalty losses (on normalized values)
-                    penalty_loss = torch.where(v2_pred < v1_pred,
-                                             v1_pred - v2_pred,
-                                             torch.zeros_like(v2_pred)).sum()
+                    v1_ref = v1_pred.detach()
+                    penalty_loss = torch.relu(v1_ref - v2_pred).pow(2).mean()
                     
                     # Consistency losses
                     consistency_loss = 0.0
@@ -1454,7 +1578,8 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/EPID_v1_15Dec25_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/EPID_v5_17Dec25_checkpoint.pth')
+
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
 
@@ -1465,7 +1590,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
 
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
-    os.environ['MASTER_PORT'] = '12355'
+    os.environ['MASTER_PORT'] = '12356'
     
     dist.init_process_group(
         "nccl", 
