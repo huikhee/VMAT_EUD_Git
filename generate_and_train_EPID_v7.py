@@ -16,7 +16,7 @@ import torch.nn.init as init
 import torch.nn.functional as F 
 
 
-from torch.utils.data import DataLoader,Dataset,random_split,Subset
+from torch.utils.data import DataLoader,Dataset,random_split,Subset,ConcatDataset
 #from torchvision import transforms
 #from torchsummary import summary
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, LambdaLR
@@ -66,6 +66,19 @@ print("NVIDIA/CUDA GPU is", "available" if has_gpu else "NOT AVAILABLE")
 print("MPS (Apple Metal) is", "AVAILABLE" if has_mps else "NOT AVAILABLE")
 print(f"Target device is {device}")
 
+# Cache for KM tensors (avoid recreating kernel tensor for every dataset)
+_KM_TENSOR_CACHE = {}
+
+
+def _get_km_tensor(KM: np.ndarray, device: torch.device) -> torch.Tensor:
+    """Return a cached KM kernel as a torch tensor on the requested device."""
+    key = (device.type, getattr(device, "index", None), id(KM), tuple(KM.shape), str(KM.dtype))
+    t = _KM_TENSOR_CACHE.get(key)
+    if t is None or t.device != device:
+        t = torch.as_tensor(KM, dtype=torch.float32, device=device).unsqueeze(0).unsqueeze(0)
+        _KM_TENSOR_CACHE[key] = t
+    return t
+
 ########################################################################################
 
 # Generate data and save
@@ -74,7 +87,7 @@ def generate_random_vectors_scalar_regular(seed):
     """Generate random vectors and scalars with regular pattern."""
     np.random.seed(seed)
     
-    num_samples = 2048
+    num_samples = 2050
     vector_length = 52
 
     # Initialize arrays
@@ -139,7 +152,7 @@ def generate_random_vectors_scalar_semiregular(seed):
     """Generate random vectors and scalars with semi-regular pattern."""
     np.random.seed(seed)
     
-    num_samples = 2048
+    num_samples = 2050
     vector_length = 52
 
     scalar1 = np.zeros(num_samples)
@@ -215,7 +228,7 @@ def generate_random_vectors_scalars(seed):
     """Generate random vectors and scalars for VMAT data."""
     np.random.seed(seed)
     
-    num_samples = 2048
+    num_samples = 2050
     vector_length = 52
 
     # Initialize arrays
@@ -305,37 +318,78 @@ def generate_random_vectors_scalars(seed):
     return vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight
 
 def create_boundary_matrix(vector1, vector2, scalar1, scalar2, scalar3):
-    """Create boundary matrix from vectors and scalars."""
-    # Convert to integers
-    vector1_int = np.round(vector1).astype(int)
-    vector2_int = np.round(vector2).astype(int)
-    scalar1_int = scalar1
-    scalar2_int = np.round(scalar2).astype(int)
-    scalar3_int = np.round(scalar3).astype(int)
+    """Create EPID field mask at 1 mm pitch on a 256x256 grid.
 
-    num_samples = len(scalar2_int)
+    Target grid:
+    - size: 256 x 256 pixels
+    - pixel pitch: 1 mm
+    - physical extent: 256 mm x 256 mm, represented as coordinates in [-128, 128) mm
+
+    Geometry:
+    - Each leaf value spans a 5 mm band in the leaf-index direction (52 leaves => 260 mm).
+    - Leaf positions (vector1/vector2) define the aperture in the orthogonal direction.
+    - Jaws (scalar2/scalar3) define the field extent in the leaf-index direction.
+
+    Rounding to 1 mm:
+    - Use floor for lower bounds and ceil for upper bounds to avoid shrinking openings
+      when rounding from sub-mm inputs.
+    """
+
+    # Convert to arrays
+    v1 = np.asarray(vector1, dtype=float)
+    v2 = np.asarray(vector2, dtype=float)
+    s2 = np.asarray(scalar2, dtype=float)
+    s3 = np.asarray(scalar3, dtype=float)
+
+    # Round to 1 mm while preserving/opening the aperture
+    v1_int = np.floor(v1).astype(int)
+    v2_int = np.ceil(v2).astype(int)
+    s2_int = np.floor(s2).astype(int)
+    s3_int = np.ceil(s3).astype(int)
+
+    size = 256
+    half = size // 2  # 128
+    mm_min = -half
+    mm_max = half
+
+    num_samples = len(s2_int)
     matrix_collection = []
-    
+
     for i in range(num_samples):
-        # Initialize matrix
-        matrix = np.zeros((261, 261))
+        matrix = np.zeros((size, size), dtype=np.float32)
 
-        # Fill matrix based on vectors
+        # Fill matrix based on leaf vectors (52 bands of 5 mm each across [-130, 130))
         for bin_index in range(52):
-            y_start = max(-130 + bin_index * 5, -130)
-            y_end = min(y_start + 5, 130)
-            matrix[y_start+130:y_end+130, 
-                  vector1_int[i,bin_index]+130:vector2_int[i,bin_index]+130] = 1
+            y_start = -130 + bin_index * 5
+            y_end = y_start + 5
 
-        # Apply scalar boundaries
-        matrix[:max(-130, int(scalar2_int[i])) + 130, :] = 0
-        matrix[min(130, int(scalar3_int[i])) + 130:, :] = 0
-        
-        # Rotate matrix
-        matrix = np.flipud(matrix)
-        rotated_matrix = scipy.ndimage.rotate(matrix, 0, reshape=False, mode='constant', cval=0.0)
-        matrix_collection.append(rotated_matrix)
+            # Clamp to EPID FOV [-128, 128)
+            y0 = max(y_start, mm_min)
+            y1 = min(y_end, mm_max)
+            if y1 <= y0:
+                continue
 
+            x0 = max(v1_int[i, bin_index], mm_min)
+            x1 = min(v2_int[i, bin_index], mm_max)
+            if x1 <= x0:
+                continue
+
+            r0 = int(y0 + half)
+            r1 = int(y1 + half)
+            c0 = int(x0 + half)
+            c1 = int(x1 + half)
+            matrix[r0:r1, c0:c1] = 1.0
+
+        # Apply jaw boundaries along the leaf-index direction
+        jaw_low = max(int(s2_int[i]), mm_min)
+        jaw_up = min(int(s3_int[i]), mm_max)
+        matrix[: jaw_low + half, :] = 0.0
+        matrix[jaw_up + half :, :] = 0.0
+
+        # Match prior orientation convention.
+        # NOTE: prior code called scipy.ndimage.rotate(..., 0, ...), which is a no-op
+        # but expensive. We keep only the flip.
+        matrix_collection.append(np.flipud(matrix))
 
     return matrix_collection
 
@@ -366,6 +420,7 @@ class CustomDataset(Dataset):
     """Custom dataset for VMAT data."""
     def __init__(self, vector1, vector2, scalar1, scalar2, scalar3, 
                  vector1_weight, vector2_weight, arrays):
+        # Store raw per-control-point arrays on CPU.
         self.vector1 = torch.from_numpy(vector1).float()
         self.vector2 = torch.from_numpy(vector2).float()
         self.scalar1 = torch.from_numpy(scalar1).float()
@@ -375,46 +430,75 @@ class CustomDataset(Dataset):
         self.vector2_weight = torch.from_numpy(vector2_weight).float()
         self.arrays = torch.from_numpy(np.array(arrays)).float()
 
+        # Precompute prev/curr paired features once to reduce per-sample Python+CPU work.
+        # Note: when loading an older torch-saved dataset object, __init__ is NOT called.
+        # We therefore also support lazy construction via _ensure_pairs().
+        self._ensure_pairs()
+
+    def _ensure_pairs(self):
+        """Build cached prev/curr paired tensors if they are missing.
+
+        torch.load() restores pickled objects without calling __init__, so older
+        on-disk datasets won't have the new cached attributes.
+        """
+        if hasattr(self, 'v1_pair') and hasattr(self, 'scalars_pair') and hasattr(self, 'arrays_curr'):
+            return
+
+        # Ensure core tensors exist.
+        for name in ('vector1', 'vector2', 'vector1_weight', 'vector2_weight', 'scalar1', 'scalar2', 'scalar3', 'arrays'):
+            if not hasattr(self, name):
+                raise AttributeError(f"CustomDataset missing required attribute '{name}'")
+
+        n = int(self.vector1.shape[0])
+        if n < 3:
+            raise ValueError(f"CustomDataset requires at least 3 control points; got n={n}")
+
+        # IMPORTANT: use slicing (views) rather than LongTensor/fancy indexing.
+        # Fancy indexing would COPY the full 256x256 arrays and can easily double+ RAM.
+        prev_sl = slice(1, -1)  # 1..n-2
+        curr_sl = slice(2, None)  # 2..n-1
+
+        self.v1_pair = torch.cat([self.vector1[prev_sl], self.vector1[curr_sl]], dim=1)            # (n-2, 104)
+        self.v2_pair = torch.cat([self.vector2[prev_sl], self.vector2[curr_sl]], dim=1)            # (n-2, 104)
+        self.v1w_pair = torch.cat([self.vector1_weight[prev_sl], self.vector1_weight[curr_sl]], dim=1)
+        self.v2w_pair = torch.cat([self.vector2_weight[prev_sl], self.vector2_weight[curr_sl]], dim=1)
+
+        s1 = self.scalar1[curr_sl]
+        s2_prev = self.scalar2[prev_sl]
+        s2_curr = self.scalar2[curr_sl]
+        s3_prev = self.scalar3[prev_sl]
+        s3_curr = self.scalar3[curr_sl]
+        self.scalars_pair = torch.stack([s1, s2_prev, s2_curr, s3_prev, s3_curr], dim=1)           # (n-2, 5)
+
+        # Views into the original arrays tensor (no copy)
+        self.arrays_curr = self.arrays[curr_sl]  # (n-2, H, W) or (n-2, 1, H, W)
+        self.arrays_prev = self.arrays[prev_sl]  # (n-2, H, W) or (n-2, 1, H, W)
+
     def __len__(self):
-        return len(self.vector1) - 2
+        self._ensure_pairs()
+        return self.v1_pair.shape[0]
 
     def __getitem__(self, idx):
-        idx += 2
-        prev_idx = idx - 1
-
-        v1 = torch.cat([self.vector1[prev_idx].unsqueeze(0), 
-                       self.vector1[idx].unsqueeze(0)], dim=1)
-        v2 = torch.cat([self.vector2[prev_idx].unsqueeze(0), 
-                       self.vector2[idx].unsqueeze(0)], dim=1)
-        v1_weight = torch.cat([self.vector1_weight[prev_idx].unsqueeze(0), 
-                             self.vector1_weight[idx].unsqueeze(0)], dim=1)
-        v2_weight = torch.cat([self.vector2_weight[prev_idx].unsqueeze(0), 
-                             self.vector2_weight[idx].unsqueeze(0)], dim=1)
-
-        scalar1 = self.scalar1[idx].unsqueeze(0).unsqueeze(0)
-        scalar2_current = self.scalar2[idx].unsqueeze(0).unsqueeze(0)
-        scalar2_previous = self.scalar2[prev_idx].unsqueeze(0).unsqueeze(0)
-        scalar3_current = self.scalar3[idx].unsqueeze(0).unsqueeze(0)
-        scalar3_previous = self.scalar3[prev_idx].unsqueeze(0).unsqueeze(0)
-
-        scalars = torch.cat([scalar1, scalar2_previous, scalar2_current, 
-                           scalar3_previous, scalar3_current], dim=1)
-
-        arrays = self.arrays[idx].unsqueeze(0)
-        arrays_p = self.arrays[prev_idx].unsqueeze(0)
-
+        self._ensure_pairs()
+        v1 = self.v1_pair[idx].unsqueeze(0)
+        v2 = self.v2_pair[idx].unsqueeze(0)
+        v1_weight = self.v1w_pair[idx].unsqueeze(0)
+        v2_weight = self.v2w_pair[idx].unsqueeze(0)
+        scalars = self.scalars_pair[idx].unsqueeze(0)
+        arrays = self.arrays_curr[idx].unsqueeze(0)
+        arrays_p = self.arrays_prev[idx].unsqueeze(0)
         return v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p
 
 
 def save_dataset(dataset, dataset_num):
     """Function to save dataset"""
-    os.makedirs("VMAT_Art_data", exist_ok=True)
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
+    os.makedirs("VMAT_Art_data_256", exist_ok=True)
+    filename = os.path.join("VMAT_Art_data_256", f"Art_dataset_coll0_{dataset_num}.pt")
     torch.save(dataset, filename)
 
 def load_dataset(dataset_num):
     """Function to load dataset"""
-    filename = os.path.join("VMAT_Art_data", f"Art_dataset_coll0_{dataset_num}.pt")
+    filename = os.path.join("VMAT_Art_data_256", f"Art_dataset_coll0_{dataset_num}.pt")
     if os.path.exists(filename):
         try:
             return torch.load(filename)
@@ -425,6 +509,8 @@ def load_dataset(dataset_num):
 
 def generate_and_save_dataset(dataset_num, KM):
     """Generate and save a complete dataset."""
+    t_total0 = time.perf_counter()
+
     # Choose the appropriate vector generation function based on dataset number
     if 0 <= dataset_num <= 79:
         vector1, vector2, scalar1, scalar2, scalar3, vector1_weight, vector2_weight = generate_random_vectors_scalar_regular(42 + dataset_num)
@@ -441,10 +527,18 @@ def generate_and_save_dataset(dataset_num, KM):
 
     num_samples = len(vector1)
     num_interpolations = 5
+    samples_per_CP = num_interpolations + 2
 
     print(f"Random MLC data {dataset_num} created")
+    print(f"[TIMER] dataset={dataset_num} | num_samples={num_samples} | interpolations={num_interpolations} | frames_per_pair={samples_per_CP}")
 
-    combined_matrix_collection = []
+    # Pre-allocate masks to avoid the memory/time overhead of building a huge Python list
+    # and then calling np.stack on it.
+    total_frames = (num_samples - 1) * samples_per_CP
+    combined_matrix_np = np.empty((total_frames, 256, 256), dtype=np.float32)
+    write_pos = 0
+
+    t_masks0 = time.perf_counter()
 
     for i in range(0, num_samples - 1):
         interpolated_v1, interpolated_v2, interpolated_s2, interpolated_s3 = \
@@ -458,43 +552,123 @@ def generate_and_save_dataset(dataset_num, KM):
         combined_s3 = [scalar3[i]] + interpolated_s3 + [scalar3[i + 1]]
         combined_s1 = np.repeat(scalar1[i], num_interpolations + 2)
 
-        combined_matrix_collection.extend(
-            create_boundary_matrix(combined_v1, combined_v2, combined_s1, 
-                                 combined_s2, combined_s3))
+        masks = create_boundary_matrix(combined_v1, combined_v2, combined_s1, combined_s2, combined_s3)
+        k = len(masks)
+        combined_matrix_np[write_pos : write_pos + k] = np.asarray(masks, dtype=np.float32)
+        write_pos += k
 
-    combined_matrix_collection_tensor = torch.stack(
-        [torch.tensor(m) for m in combined_matrix_collection]).float().to(device)
+    t_masks1 = time.perf_counter()
+    print(f"[TIMER] mask_rasterize_sec={t_masks1 - t_masks0:.3f} | frames_written={write_pos}")
 
-    KM_tensor = torch.tensor(KM).float().unsqueeze(0).unsqueeze(0).to(device)
-    arrays_gpu = F.conv2d(combined_matrix_collection_tensor.unsqueeze(1), 
-                         KM_tensor, padding='same')
+    if write_pos != total_frames:
+        combined_matrix_np = combined_matrix_np[:write_pos]
+        total_frames = write_pos
+
+    # Convolve in chunks to reduce GPU peak memory. This avoids sending the full
+    # (frames x 256 x 256) tensor to GPU at once.
+    # NOTE: This script enables cuDNN autotuning (cudnn.benchmark=True) for training speed.
+    # For *this* convolution (large, unusual kernel), autotuning can take a very long time
+    # on the first call. We disable it locally to avoid a huge one-time stall.
+    _prev_cudnn_benchmark = torch.backends.cudnn.benchmark
+    torch.backends.cudnn.benchmark = False
+    try:
+        km_tensor = _get_km_tensor(KM, device)
+        masks_cpu = torch.from_numpy(combined_matrix_np)  # (N, H, W) on CPU
+        arrays_cpu = torch.empty((total_frames, 1, 256, 256), dtype=torch.float32)
+        conv_chunk = 256
+
+        if device.type == "cuda":
+            torch.cuda.synchronize()
+        t_conv0 = time.perf_counter()
+
+        with torch.no_grad():
+            for chunk_idx, start in enumerate(range(0, total_frames, conv_chunk)):
+                end = min(start + conv_chunk, total_frames)
+
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_h2d0 = time.perf_counter()
+                inp = masks_cpu[start:end].unsqueeze(1).to(device)
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_h2d1 = time.perf_counter()
+
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_kern0 = time.perf_counter()
+                out = F.conv2d(inp, km_tensor, padding='same')
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_kern1 = time.perf_counter()
+
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_d2h0 = time.perf_counter()
+                arrays_cpu[start:end] = out.detach().cpu()
+                if device.type == "cuda":
+                    torch.cuda.synchronize()
+                t_d2h1 = time.perf_counter()
+
+                h2d = t_h2d1 - t_h2d0
+                kern = t_kern1 - t_kern0
+                d2h = t_d2h1 - t_d2h0
+                total = h2d + kern + d2h
+                n_frames = end - start
+                fps = (n_frames / total) if total > 0 else float("inf")
+                print(
+                    f"[TIMER] conv_chunk {chunk_idx:03d} | frames {start}:{end} | "
+                    f"h2d={h2d:.3f}s conv={kern:.3f}s d2h={d2h:.3f}s | {fps:.1f} frames/s"
+                )
+
+                # Release GPU tensors promptly in long loops
+                del inp
+                del out
+    finally:
+        torch.backends.cudnn.benchmark = _prev_cudnn_benchmark
+
+    if device.type == "cuda":
+        torch.cuda.synchronize()
+    t_conv1 = time.perf_counter()
+    print(
+        f"[TIMER] conv2d_total_sec={t_conv1 - t_conv0:.3f} | conv_chunk={conv_chunk} | device={device}"
+    )
     print(f"Arrays {dataset_num} created")
 
-    new_size = (131, 131)
-    arrays_gpu_131 = F.interpolate(arrays_gpu, size=new_size, 
-                                 mode='bilinear', align_corners=False)
-    arrays = arrays_gpu_131.cpu()
+    # v7: keep native 256x256 EPID resolution (1 mm pitch over 256 mm x 256 mm)
+    arrays = arrays_cpu
 
     noise_std = 0.005
-    for j in range(len(arrays)):
-        noise = torch.randn(arrays[j].shape) * noise_std
-        arrays[j] += noise
+    arrays = arrays + noise_std * torch.randn_like(arrays)
 
-    final_arrays_list = []
-    samples_per_CP = num_interpolations + 2
+    total_frames = arrays.shape[0]
 
-    for j in range(len(arrays) // samples_per_CP):
-        final_array = sum(arrays[j * samples_per_CP + k] * 
-                         (scalar1[j+1] / samples_per_CP) 
-                         for k in range(samples_per_CP))
-        final_arrays_list.append(final_array.numpy())
+    # We keep arrays[0] as the first frame, then for each CP we aggregate its sub-frames.
+    # Original code used scalar1[j+1] as the weighting for CP j.
+    t_agg0 = time.perf_counter()
+    num_cps = total_frames // samples_per_CP
+    if num_cps <= 0:
+        final_arrays = arrays.cpu().numpy()
+    else:
+        frames = arrays[: num_cps * samples_per_CP]  # drop any remainder
+        frames = frames.view(num_cps, samples_per_CP, *frames.shape[1:])  # (num_cps, K, 1, H, W)
+        summed = frames.sum(dim=1)  # (num_cps, 1, H, W)
 
-    final_arrays = np.array([arrays[0].numpy()] + final_arrays_list)
+        weights = torch.tensor(scalar1[1 : num_cps + 1], dtype=summed.dtype, device=summed.device)
+        weights = (weights / samples_per_CP).view(num_cps, 1, 1, 1)
+        summed = summed * weights
+
+        final = torch.cat([arrays[0:1], summed], dim=0)
+        final_arrays = final.cpu().numpy()
+
+    t_agg1 = time.perf_counter()
+    print(f"[TIMER] aggregate_sec={t_agg1 - t_agg0:.3f} | num_cps={num_cps}")
 
     Art_dataset = CustomDataset(vector1, vector2, scalar1, scalar2, scalar3,
                               vector1_weight, vector2_weight, final_arrays)
 
     save_dataset(Art_dataset, dataset_num)
+    t_total1 = time.perf_counter()
+    print(f"[TIMER] dataset_total_sec={t_total1 - t_total0:.3f} | dataset={dataset_num}")
     return Art_dataset
 
 
@@ -703,16 +877,22 @@ class EncoderUNet(nn.Module):
         self.decoder2 = DecoderBlock(in_channels=128, out_channels=64)  # 16x16 -> 32x32
         self.decoder1 = DecoderBlock(in_channels=64,  out_channels=32)  # 32x32 -> 64x64
         
-        # Upsample from 64x64 -> 128x128
-        self.up1 = nn.ConvTranspose2d(in_channels=32, out_channels=16,
-                                      kernel_size=3, stride=2, 
-                                      padding=1, output_padding=1)
-        
-        # Final conv from 16->1 channel
-        self.final_conv = nn.Conv2d(in_channels=16, out_channels=1, kernel_size=3, padding=1)
-        
-        # Resize 128x128 -> 131x131
-        self.final_resize = nn.Upsample(size=(131, 131), mode='bilinear', align_corners=False)
+        # v7: Upsample from 64x64 -> 128x128 -> 256x256
+        self.up1 = nn.ConvTranspose2d(
+            in_channels=32,
+            out_channels=16,
+            kernel_size=2,
+            stride=2,
+        )
+        self.up2 = nn.ConvTranspose2d(
+            in_channels=16,
+            out_channels=8,
+            kernel_size=2,
+            stride=2,
+        )
+
+        # Final conv to 1 channel at 256x256
+        self.final_conv = nn.Conv2d(in_channels=8, out_channels=1, kernel_size=3, padding=1)
 
     def forward(self, vector1, vector2, scalars):
         """
@@ -721,8 +901,8 @@ class EncoderUNet(nn.Module):
           vector2: [B, 1, 104] => Flatten to [B, 104]
           scalars: [B, 1, scalar_count], e.g. [B,1,5] => Squeeze => [B,5]
         
-        Returns:
-          (B, 1, 131, 131) single-channel output image
+                Returns:
+                    (B, 1, 256, 256) single-channel output image
         """
         # -----------------------------------------------------------------
         # Parameter transformer: (v1/v2/scalars) -> latent_image (B,1,64,64)
@@ -785,16 +965,13 @@ class EncoderUNet(nn.Module):
         u2 = self.decoder2(u3, f2)           # 16->32
         u1 = self.decoder1(u2, f1)           # 32->64
         
-        # Upsample from 64->128
-        up1 = self.up1(u1)  # => [B,16,128,128]
-        up1 = self.relu(up1)
-        
-        # Final conv => [B,1,128,128]
-        output_image = self.final_conv(up1)
+        # Upsample from 64->128->256
+        up1 = self.relu(self.up1(u1))   # [B,16,128,128]
+        up2 = self.relu(self.up2(up1))  # [B,8,256,256]
+
+        # Final conv => [B,1,256,256]
+        output_image = self.final_conv(up2)
         output_image = self.relu(output_image)
-        
-        # Resize 128->131
-        output_image = self.final_resize(output_image)
         
         return output_image, latent_image
 
@@ -803,10 +980,10 @@ class EncoderUNet(nn.Module):
 
 class UNetDecoder(nn.Module):
     """
-    Takes a 2-channel 131x131 image and:
-      1) Two-step downsample to 64x64:
-         (a) 131->128 by bilinear up/downsampling
-         (b) 128->64 by MaxPool2d
+        Takes a 2-channel 256x256 image and:
+            1) Two-step downsample to 64x64 via MaxPool2d:
+                 (a) 256->128
+                 (b) 128->64
       2) Pass through a UNet (3 encoder levels + bottleneck + 3 decoder levels)
       3) Squeeze channels to 1 (1x64x64)
                 4) v5: Transformer token heads with structured query design:
@@ -822,10 +999,9 @@ class UNetDecoder(nn.Module):
         self.relu = nn.ReLU(inplace=True)
         
         # --------------------
-        # Step 1: 131 -> 128 (non-trainable bilinear interpolation)
-        # Step 2: 128 -> 64  (MaxPool2d, standard downsampling)
+        # v7: 256 -> 128 -> 64 (MaxPool2d downsampling)
         # --------------------
-        self.downsample_to_128 = nn.Upsample(size=(128, 128), mode='bilinear', align_corners=False)
+        self.downsample_256_to_128 = nn.MaxPool2d(kernel_size=2, stride=2)
         self.downsample_128_to_64 = nn.MaxPool2d(kernel_size=2, stride=2)
         
         # --------------------
@@ -951,7 +1127,7 @@ class UNetDecoder(nn.Module):
 
     def forward(self, x):
         """
-        x: (batch_size, 2, 131, 131) input image
+        x: (batch_size, 2, 256, 256) input image
         Returns:
             reconstructed_vector1, reconstructed_vector2, reconstructed_scalars
         """
@@ -962,8 +1138,12 @@ class UNetDecoder(nn.Module):
         # --------------------
         # Two-step downsampling
         # --------------------
-        x = self.downsample_to_128(x)       # (B, 2, 128, 128)
-        x = self.downsample_128_to_64(x)    # (B, 2, 64, 64)
+        # Be tolerant during transition: coerce any HxW to 256x256 first.
+        if x.size(-2) != 256 or x.size(-1) != 256:
+            x = F.interpolate(x, size=(256, 256), mode='bilinear', align_corners=False)
+
+        x = self.downsample_256_to_128(x)   # (B, 2, 128, 128)
+        x = self.downsample_128_to_64(x)   # (B, 2, 64, 64)
 
         # --------------------
         # UNet Encoder (v6: separate prev/curr encoders, fuse late)
@@ -1365,10 +1545,10 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
             # Accumulate losses on GPU to avoid per-batch CPU sync (.item()).
             loader_loss_sum = torch.zeros((), device=device)
             loader_accuracy_sum = 0.0
-
+            
             prev_iter_end = time.perf_counter()
             timing_prints = 0
-            
+
             for batch_idx, (v1, v2, scalars, v1_weight, v2_weight, arrays, arrays_p) in enumerate(train_loader):
                 do_timing = (
                     rank == 0
@@ -1656,7 +1836,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                             flush=True,
                         )
                         timing_prints += 1
-
+                    
                     loader_loss_sum += loss.detach()
                     loader_accuracy_sum += accuracy
 
@@ -1751,7 +1931,7 @@ def train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, ba
                 'val_accuracies': val_accuracies,
             }
             
-            torch.save(checkpoint, 'Cross_CP/EPID_v6_17Dec25_checkpoint.pth')
+            torch.save(checkpoint, 'Cross_CP/EPID_v7_20Dec25_checkpoint.pth')
 
 
     return train_losses, val_losses, train_accuracies, val_accuracies           
@@ -1788,8 +1968,8 @@ def train_ddp(rank, world_size, generate_flag, KM):
     
     device = torch.device(f'cuda:{rank}')
     
-    train_loaders = []
-    val_loaders = []
+    train_datasets = []
+    val_datasets = []
 
     # Calculate dataset range for this rank
 
@@ -1797,9 +1977,11 @@ def train_ddp(rank, world_size, generate_flag, KM):
     start_dataset = rank * datasets_per_gpu
     end_dataset = start_dataset + datasets_per_gpu
 
+    warned_non_divisible = False
+
     # Generate or load datasets assigned to this GPU
     for dataset_num in range(start_dataset, end_dataset):
-    #for dataset_num in range(0, 640, 80): #local
+    #for dataset_num in range(0, 1, 80): #local
         start_time = time.time()
 
         if generate_flag == 0:
@@ -1824,33 +2006,55 @@ def train_ddp(rank, world_size, generate_flag, KM):
         train_indices = list(range(split))
         val_indices = list(range(split, dataset_size))
 
-        train_ds = Subset(Art_dataset, train_indices)
-        val_ds = Subset(Art_dataset, val_indices)
+        # Safety: within-batch consistency loss assumes consecutive samples within a batch
+        # belong to the same underlying sequence. This holds if each subset length is a
+        # multiple of batch_size. With dataset_size=2048 and batch_size=128//world_size,
+        # it is divisible (train=1664, val=384). If you override batch_size elsewhere,
+        # this warning helps catch unintended boundary mixing.
+        if (not warned_non_divisible) and (split % max(1, (128 // world_size)) != 0 or (dataset_size - split) % max(1, (128 // world_size)) != 0):
+            if rank == 0:
+                print(
+                    f"[WARN] train/val split lengths not divisible by batch_size: "
+                    f"dataset_size={dataset_size} split={split} batch_size={128 // world_size}. "
+                    "Batches may straddle boundaries and slightly affect consistency_loss.",
+                    flush=True,
+                )
+            warned_non_divisible = True
 
-        # Adjust batch size based on available GPU memory
-        batch_size = 128// world_size  # Scale batch size by number of GPUs
-    
-
-        train_loader = DataLoader(
-            train_ds, 
-            batch_size=batch_size,
-            shuffle=False,  # Keep sequential order
-            pin_memory=True
-        )
-        
-        val_loader = DataLoader(
-            val_ds, 
-            batch_size=batch_size,
-            shuffle=False,
-            pin_memory=True
-        )
-
-        train_loaders.append(train_loader)
-        val_loaders.append(val_loader)
+        train_datasets.append(Subset(Art_dataset, train_indices))
+        val_datasets.append(Subset(Art_dataset, val_indices))
 
         end_time = time.time()
         print(f"[GPU {rank}] Dataset {dataset_num} processing time: {end_time - start_time:.2f} seconds")
         print(f"[GPU {rank}] Dataset {dataset_num} is done")
+
+    # Collapse the per-dataset subsets into a single dataset per split.
+    # This avoids paying DataLoader iterator + first-batch overhead 640 times per epoch,
+    # which is exactly what shows up as large data_wait spikes on fast GPUs.
+    train_ds_all = ConcatDataset(train_datasets) if len(train_datasets) > 1 else train_datasets[0]
+    val_ds_all = ConcatDataset(val_datasets) if len(val_datasets) > 1 else val_datasets[0]
+
+    # Adjust batch size based on available GPU memory
+    batch_size = 128 // world_size  # Scale batch size by number of GPUs
+
+    # DataLoader tuning (cluster-safe defaults). If you truly can only use 0/1 worker,
+    # set EPID_NUM_WORKERS=0 or 1.
+    num_workers = int(os.environ.get('EPID_NUM_WORKERS', '0'))
+    pin_memory = os.environ.get('EPID_PIN_MEMORY', '1').strip() not in ('0', 'false', 'False', 'no', 'NO')
+    persistent_workers = bool(num_workers > 0)
+    prefetch_factor = int(os.environ.get('EPID_PREFETCH_FACTOR', '2'))
+
+    loader_kwargs = dict(
+        shuffle=False,
+        pin_memory=pin_memory,
+        num_workers=num_workers,
+        persistent_workers=persistent_workers,
+    )
+    if num_workers > 0:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    train_loader = DataLoader(train_ds_all, batch_size=batch_size, **loader_kwargs)
+    val_loader = DataLoader(val_ds_all, batch_size=batch_size, **loader_kwargs)
 
     # Initialize models
     vector_dim = 104
@@ -1873,7 +2077,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
         print(f"unetdecoder device: {next(unetdecoder.parameters()).device}")
         print("Starting training...")
     
-    train_cross(encoderunet, unetdecoder, train_loaders, val_loaders, device, batch_size, resume=1)
+    train_cross(encoderunet, unetdecoder, [train_loader], [val_loader], device, batch_size, resume=0)
     
     if rank == 0:
         print("Training completed!")
@@ -1886,7 +2090,7 @@ if __name__ == "__main__":
     KM = KM_data['KM_1500']
 
     # Create directories if they don't exist
-    os.makedirs("VMAT_Art_data", exist_ok=True)
+    os.makedirs("VMAT_Art_data_256", exist_ok=True)
     os.makedirs("Cross_CP", exist_ok=True)
 
     # Set generation flag

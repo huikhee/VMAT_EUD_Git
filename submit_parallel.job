@@ -1,19 +1,53 @@
 #!/bin/bash
 #SBATCH --partition=mpcg.p
-#SBATCH --gpus-per-node=1
-#SBATCH --mem=128G           
+#SBATCH --gpus-per-node=2
+#SBATCH --nodes=1
+#SBATCH --ntasks=1
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=400G           
 #SBATCH --time=2-0:05  
-#SBATCH --job-name GnT_EPID_v1          
-#SBATCH --output=GnT_EPID_v1.%j.out        
-#SBATCH --error=GnT_EPID_v1.%j.err          
+#SBATCH --job-name GnT_EPID_v8      
+#SBATCH --output=GnT_EPID_v8.%j.out        
+#SBATCH --error=GnT_EPID_v8.%j.err          
 
 module load Python/3.11.3-GCCcore-13.1.0
 module load PyTorch/2.1.2-foss-2023a-CUDA-12.4.0
 
 module load CUDA/12.4.0
 
+# Keep CPU threading predictable; DataLoader/host-side batch prep is the bottleneck.
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+
+# Optional EPID runtime knobs (commented out by default).
+# Enable any of these by uncommenting and setting a value.
+#
+# Distributed / spawning:
+ export EPID_WORLD_SIZE=2          # number of DDP ranks to spawn (usually = GPUs per node)
+#
+# Batch size:
+# export EPID_BATCH_SIZE=64         # per-rank batch size override; if unset, uses 128//world_size
+#
+# Dataset assignment / selection:
+# export EPID_DATASET_SHUFFLE=1     # 1=shuffle dataset IDs (default), 0=disable
+# export EPID_DATASET_SEED=12345    # deterministic shuffle seed
+# export EPID_DATASET_RANGE="0:640:80"   # range spec: start:stop:step (mutually exclusive with EPID_DATASET_IDS)
+# export EPID_DATASET_IDS="0,80,160"     # explicit list (mutually exclusive with EPID_DATASET_RANGE)
+#
+# DataLoader:
+# export EPID_NUM_WORKERS=0         # DataLoader workers (PyTorch multiprocessing)
+# export EPID_PIN_MEMORY=1          # 1=pin memory (default), 0=disable
+# export EPID_PREFETCH_FACTOR=2     # only used when EPID_NUM_WORKERS > 0
+#
+# Timing / logging:
+# export EPID_TIMING_EVERY=0        # 0=minimal timing output, >0 prints every N batches
+# export EPID_TIMING_MAX=1          # max timing lines per epoch
+#
+# Notes:
+# - MASTER_ADDR/MASTER_PORT can be exported here to avoid port collisions when multiple jobs share a node.
+
 # Start GPU monitoring in the background
-#nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 5 > $HOME/VMAT_EUD/gpu_usage.log &
+nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 5 > $HOME/VMAT_EUD/gpu_usagev8.log &
 
 # Get the total number of GPUs on the node
 #NUM_GPUS=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits)
@@ -23,7 +57,7 @@ module load CUDA/12.4.0
 #    nvidia-smi --id=$GPU_ID --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 1 > $HOME/VMAT_EUD/gpu_${GPU_ID}_usage.log &
 #done
 
-srun python generate_and_train_EPID_v5.py
+srun --cpu-bind=cores python generate_and_train_EPID_v8.py
 
 # Kill the GPU monitoring process after the training script finishes
 pkill -f nvidia-smi
