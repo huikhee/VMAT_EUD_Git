@@ -661,7 +661,14 @@ def main() -> None:
     parser.add_argument(
         "--loss-plot-logy",
         action="store_true",
-        help="Use log scale for loss plot y-axis.",
+        default=True,
+        help="Use log scale for loss plot y-axis (default: enabled).",
+    )
+    parser.add_argument(
+        "--loss-plot-lineary",
+        dest="loss_plot_logy",
+        action="store_false",
+        help="Use linear scale for loss plot y-axis (disables log scale).",
     )
 
     parser.add_argument("--ckpt-v3", type=str, default="Cross_CP/EPID_v3_16Dec25_checkpoint.pth")
