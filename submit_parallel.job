@@ -1,14 +1,14 @@
 #!/bin/bash
 #SBATCH --partition=mpcg.p
-#SBATCH --gpus-per-node=2
+#SBATCH --gpus-per-node=1
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=400G           
 #SBATCH --time=2-0:05  
 #SBATCH --job-name GnT_EPID_v8      
-#SBATCH --output=GnT_EPID_v8.%j.out        
-#SBATCH --error=GnT_EPID_v8.%j.err          
+#SBATCH --output=GnT_EPID_v8a.%j.out        
+#SBATCH --error=GnT_EPID_v8a.%j.err          
 
 module load Python/3.11.3-GCCcore-13.1.0
 module load PyTorch/2.1.2-foss-2023a-CUDA-12.4.0
@@ -23,7 +23,7 @@ export MKL_NUM_THREADS=1
 # Enable any of these by uncommenting and setting a value.
 #
 # Distributed / spawning:
- export EPID_WORLD_SIZE=2          # number of DDP ranks to spawn (usually = GPUs per node)
+ export EPID_WORLD_SIZE=1          # number of DDP ranks to spawn (usually = GPUs per node)
 #
 # Batch size:
 # export EPID_BATCH_SIZE=64         # per-rank batch size override; if unset, uses 128//world_size
@@ -47,7 +47,7 @@ export MKL_NUM_THREADS=1
 # - MASTER_ADDR/MASTER_PORT can be exported here to avoid port collisions when multiple jobs share a node.
 
 # Start GPU monitoring in the background
-nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 5 > $HOME/VMAT_EUD/gpu_usagev8.log &
+nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 5 > $HOME/VMAT_EUD/gpu_usagev8a.log &
 
 # Get the total number of GPUs on the node
 #NUM_GPUS=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits)
@@ -57,7 +57,7 @@ nvidia-smi --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total
 #    nvidia-smi --id=$GPU_ID --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 1 > $HOME/VMAT_EUD/gpu_${GPU_ID}_usage.log &
 #done
 
-srun --cpu-bind=cores python generate_and_train_EPID_v8.py
+srun --cpu-bind=cores python generate_and_train_EPID_v8a.py
 
 # Kill the GPU monitoring process after the training script finishes
 pkill -f nvidia-smi

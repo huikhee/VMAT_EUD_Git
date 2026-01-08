@@ -21,7 +21,7 @@ module load CUDA/12.4.0
 #    nvidia-smi --id=$GPU_ID --query-gpu=timestamp,utilization.gpu,utilization.memory,memory.total,memory.used --format=csv -l 1 > $HOME/VMAT_EUD/gpu_${GPU_ID}_usage.log &
 #done
 
-srun python generate_and_train_amp.py
+srun python generate_and_train_amp_coll0_ResBlock.py
 
 # Kill the GPU monitoring process after the training script finishes
 #pkill -f nvidia-smi
