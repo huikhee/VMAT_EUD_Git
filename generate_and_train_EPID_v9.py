@@ -66,11 +66,57 @@ print("NVIDIA/CUDA GPU is", "available" if has_gpu else "NOT AVAILABLE")
 print("MPS (Apple Metal) is", "AVAILABLE" if has_mps else "NOT AVAILABLE")
 print(f"Target device is {device}")
 
-# Allow external wrappers (e.g., v9) to change the checkpoint path without
-# modifying the training loop logic.
+# v9: write checkpoints to a v9-named path by default (can override via EPID_CHECKPOINT_PATH)
 CHECKPOINT_PATH = os.environ.get(
-    "EPID_CHECKPOINT_PATH", "Cross_CP/EPID_v8_23Dec25_checkpoint.pth"
+    "EPID_CHECKPOINT_PATH", "Cross_CP/EPID_v9_08Jan26_checkpoint.pth"
 )
+
+
+# -------------------------------------------------------------------------
+# v9 KM kernel: averaged isotropic Gaussian+Lorentz mixture (1 mm grid)
+# -------------------------------------------------------------------------
+# Averaged isotropic parameters (from profile fits @ SID=1000mm)
+# Model: k(x) = w*G(sigma) + (1-w)*L(gamma)
+ISO_W = 0.7830772142043271
+ISO_SIGMA_MM = 2.1829866032622256
+ISO_GAMMA_MM = 12.842773030826535
+
+
+def _gaussian_1d(x_mm: np.ndarray, sigma_mm: float) -> np.ndarray:
+    sigma = float(sigma_mm)
+    return np.exp(-0.5 * (x_mm / sigma) ** 2)
+
+
+def _lorentz_1d(x_mm: np.ndarray, gamma_mm: float) -> np.ndarray:
+    gamma = float(gamma_mm)
+    return gamma / (math.pi * (x_mm**2 + gamma**2))
+
+
+def build_km_kernel_1mm(size: int = 256) -> np.ndarray:
+    """Build a separable 2D kernel on a 1mm grid, normalized so sum(kernel)=1.
+
+    - Resolution: 1 mm in both directions.
+    - Shape: defaults to 256x256 to match the EPID array size.
+    """
+    # Use a centered coordinate grid in mm. For even sizes this yields half-mm offsets
+    # (e.g. 256 -> -127.5..127.5), which keeps the kernel centered.
+    x_mm = (np.arange(size, dtype=np.float64) - (size - 1) / 2.0)  # 1 mm pitch
+
+    g = _gaussian_1d(x_mm, ISO_SIGMA_MM)
+    l = _lorentz_1d(x_mm, ISO_GAMMA_MM)
+
+    # Discrete normalization (dx=1mm) to match conv2d weight usage.
+    g = g / g.sum()
+    l = l / l.sum()
+
+    k1d = float(ISO_W) * g + (1.0 - float(ISO_W)) * l
+    k1d = k1d / k1d.sum()
+
+    k2d = np.outer(k1d, k1d)
+    k2d = k2d / k2d.sum()
+    return k2d.astype(np.float32)
+
+# (v9 keeps CHECKPOINT_PATH above)
 
 # Cache for KM tensors (avoid recreating kernel tensor for every dataset)
 _KM_TENSOR_CACHE = {}
@@ -2164,8 +2210,7 @@ def train_ddp(rank, world_size, generate_flag, KM):
 
 if __name__ == "__main__":
     # Load KM matrix
-    KM_data = scipy.io.loadmat('data/KM_1500.mat')
-    KM = KM_data['KM_1500']
+    KM = build_km_kernel_1mm(size=256)
 
     # Create directories if they don't exist
     os.makedirs("VMAT_Art_data_256", exist_ok=True)
