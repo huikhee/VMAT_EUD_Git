@@ -625,6 +625,17 @@ def generate_and_save_dataset(dataset_num, KM):
     torch.backends.cudnn.benchmark = False
     try:
         km_tensor = _get_km_tensor(KM, device)
+        # Implement a version-agnostic "same" padding for conv2d.
+        # PyTorch's padding='same' support varies by version, and even-sized kernels
+        # require asymmetric padding to preserve spatial size.
+        k_h, k_w = int(km_tensor.shape[-2]), int(km_tensor.shape[-1])
+        pad_h = k_h - 1
+        pad_w = k_w - 1
+        pad_top = pad_h // 2
+        pad_bottom = pad_h - pad_top
+        pad_left = pad_w // 2
+        pad_right = pad_w - pad_left
+        same_pad = (pad_left, pad_right, pad_top, pad_bottom)  # (W_left, W_right, H_top, H_bottom)
         masks_cpu = torch.from_numpy(combined_matrix_np)  # (N, H, W) on CPU
         arrays_cpu = torch.empty((total_frames, 1, 256, 256), dtype=torch.float32)
         conv_chunk = 256
@@ -648,7 +659,13 @@ def generate_and_save_dataset(dataset_num, KM):
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t_kern0 = time.perf_counter()
-                out = F.conv2d(inp, km_tensor, padding='same')
+                inp_padded = F.pad(inp, same_pad)
+                out = F.conv2d(inp_padded, km_tensor)
+                if out.shape[-2:] != (256, 256):
+                    raise RuntimeError(
+                        f"Unexpected conv2d output spatial size {tuple(out.shape[-2:])}; expected (256, 256). "
+                        f"Kernel={tuple(km_tensor.shape[-2:])} pad={same_pad} inp={tuple(inp.shape)}"
+                    )
                 if device.type == "cuda":
                     torch.cuda.synchronize()
                 t_kern1 = time.perf_counter()
@@ -674,6 +691,7 @@ def generate_and_save_dataset(dataset_num, KM):
 
                 # Release GPU tensors promptly in long loops
                 del inp
+                del inp_padded
                 del out
     finally:
         torch.backends.cudnn.benchmark = _prev_cudnn_benchmark
